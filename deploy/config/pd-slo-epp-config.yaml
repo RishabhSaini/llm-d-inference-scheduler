@@ -1,0 +1,39 @@
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: prefill-filter
+- type: decode-filter
+- type: prefill-header-handler
+- type: prefix-cache-scorer
+  parameters:
+    blockSize: 5
+- type: predicted-latency-scorer
+  name: pd-slo-scorer
+  parameters:
+    endpointRoleLabel: "llm-d.ai/role"
+    sloBufferFactor: 1.0
+    headroomSelectionStrategy: "least"
+- type: max-score-picker
+- type: pd-profile-handler
+  parameters:
+    threshold: 100
+    decodeProfile: "decode"
+    prefillProfile: "prefill"
+    hashBlockSize: 5
+
+schedulingProfiles:
+- name: decode
+  plugins:
+  - pluginRef: decode-filter
+  - pluginRef: prefix-cache-scorer
+  - pluginRef: pd-slo-scorer
+    weight: 100
+  - pluginRef: max-score-picker
+
+- name: prefill
+  plugins:
+  - pluginRef: prefill-filter
+  - pluginRef: prefix-cache-scorer
+  - pluginRef: pd-slo-scorer
+    weight: 100
+  - pluginRef: max-score-picker
