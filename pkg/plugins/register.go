@@ -28,4 +28,5 @@ func RegisterAllPlugins() {
 	// pd decider plugins
 	plugin.Register(profile.PrefixBasedPDDeciderPluginType, profile.PrefixBasedPDDeciderPluginFactory)
 	plugin.Register(profile.AlwaysDisaggDeciderPluginType, profile.AlwaysDisaggPDDeciderPluginFactory)
+	plugin.Register(profile.AdaptivePDDeciderPluginType, profile.AdaptivePDDeciderPluginFactory)
 }

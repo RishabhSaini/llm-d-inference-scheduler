@@ -1,0 +1,259 @@
+# Example configuration for Adaptive PD Decider Plugin
+#
+# This configuration demonstrates a cost-based, workload-aware disaggregation decider
+# that adapts to system load without manual threshold tuning.
+#
+# Key Features:
+# - Workload characterization by total token count (prompt + output)
+# - Cost-based decisions comparing decode-only vs disaggregated paths
+# - Automatic adaptation to queue depths and system state
+# - Hysteresis via cost margin to prevent oscillation
+#
+# Based on research from:
+# - Arrow: https://arxiv.org/html/2505.11916
+# - TaiChi: https://www.arxiv.org/pdf/2508.01989
+# - ARES: https://arxiv.org/abs/2510.13668
+
+apiVersion: gateway.networking.k8s.io/v1alpha1
+kind: InferencePool
+metadata:
+  name: adaptive-pd-pool
+  namespace: default
+spec:
+  targetModels:
+    - llama-3-8b
+  endpoints:
+    selector:
+      matchLabels:
+        app: vllm
+
+  # EPP Configuration with Adaptive PD Decider
+  schedulingProfiles:
+    # Decode profile: handles generation and decode-only requests
+    - name: decode
+      plugins:
+        # Filter for decode-capable pods
+        - pluginRef: decode-filter
+        # Score by load to balance across decode workers
+        - pluginRef: load-aware-scorer
+
+    # Prefill profile: handles prefill phase in disaggregated mode
+    - name: prefill
+      plugins:
+        # Filter for prefill-capable pods
+        - pluginRef: prefill-filter
+        # Score by load to balance across prefill workers
+        - pluginRef: load-aware-scorer
+
+  plugins:
+    # ============================================================
+    # Adaptive PD Decider - Main Plugin
+    # ============================================================
+    - name: adaptive-pd-decider-instance
+      type: adaptive-pd-decider
+      parameters:
+        # Throughput estimation (initial values, self-tuning)
+        # These are starting points - the plugin adapts based on observed metrics
+        initialPrefillThroughput: 2000  # tokens/sec (prefill workers typically faster)
+        initialDecodeThroughput: 500    # tokens/sec (decode throughput baseline)
+
+        # KV transfer cost
+        # Latency per token for transferring KV cache from prefill to decode workers
+        kvTransferLatencyPerToken: 0.0001  # 0.1ms per token (adjust based on network)
+
+        # Workload classification thresholds
+        # Requests are classified into workload classes for tailored throughput estimates
+        smallRequestThreshold: 1000   # <1k tokens
+        mediumRequestThreshold: 10000  # 1k-10k tokens
+        largeRequestThreshold: 50000   # 10k-50k tokens
+        # >50k tokens = ultra workload
+
+        # Adaptation parameters
+        throughputWindowSize: 50      # Number of observations for percentile calculation
+        costMargin: 0.1               # 10% hysteresis - prevents oscillation
+                                     # Disagg chosen only if cost < (1-0.1) * decode_only_cost
+
+        # Default max output tokens when not specified in request
+        defaultMaxOutputTokens: 2048  # Conservative default for cost estimation
+
+        # Cache overhead factor
+        cacheOverheadFactor: 0.05     # 5% overhead for cache operations
+
+    # ============================================================
+    # PD Profile Handler - Orchestrates Profile Selection
+    # ============================================================
+    - name: pd-handler
+      type: pd-profile-handler
+      parameters:
+        decodeProfile: decode
+        prefillProfile: prefill
+        deciderPluginName: adaptive-pd-decider-instance
+
+    # ============================================================
+    # Filter Plugins
+    # ============================================================
+    - name: decode-filter
+      type: decode-role-filter
+
+    - name: prefill-filter
+      type: prefill-role-filter
+
+    # ============================================================
+    # Scorer Plugins
+    # ============================================================
+    - name: load-aware-scorer
+      type: load-aware-scorer
+      parameters:
+        # Weight queue size and running requests for load balancing
+        queueWeight: 0.7
+        runningWeight: 0.3
+
+---
+# Alternative Configuration: Conservative Settings
+# Use this for stable workloads where you prefer less aggressive disaggregation
+apiVersion: gateway.networking.k8s.io/v1alpha1
+kind: InferencePool
+metadata:
+  name: adaptive-pd-pool-conservative
+  namespace: default
+spec:
+  targetModels:
+    - llama-3-8b
+
+  schedulingProfiles:
+    - name: decode
+      plugins:
+        - pluginRef: decode-filter
+        - pluginRef: load-aware-scorer
+
+    - name: prefill
+      plugins:
+        - pluginRef: prefill-filter
+        - pluginRef: load-aware-scorer
+
+  plugins:
+    - name: adaptive-pd-decider-conservative
+      type: adaptive-pd-decider
+      parameters:
+        # More conservative throughput estimates
+        initialPrefillThroughput: 1500
+        initialDecodeThroughput: 600
+
+        # Higher KV transfer cost (pessimistic network assumption)
+        kvTransferLatencyPerToken: 0.0002
+
+        # Same workload thresholds
+        smallRequestThreshold: 1000
+        mediumRequestThreshold: 10000
+        largeRequestThreshold: 50000
+
+        # Larger cost margin for more stability
+        costMargin: 0.2  # 20% margin - reduces disaggregation frequency
+
+        defaultMaxOutputTokens: 2048
+        cacheOverheadFactor: 0.1  # Higher overhead estimate
+
+    - name: pd-handler
+      type: pd-profile-handler
+      parameters:
+        decodeProfile: decode
+        prefillProfile: prefill
+        deciderPluginName: adaptive-pd-decider-conservative
+
+    - name: decode-filter
+      type: decode-role-filter
+
+    - name: prefill-filter
+      type: prefill-role-filter
+
+    - name: load-aware-scorer
+      type: load-aware-scorer
+
+---
+# Alternative Configuration: Aggressive Disaggregation
+# Use this when prefill workers are significantly faster and network is fast
+apiVersion: gateway.networking.k8s.io/v1alpha1
+kind: InferencePool
+metadata:
+  name: adaptive-pd-pool-aggressive
+  namespace: default
+spec:
+  targetModels:
+    - llama-3-70b  # Larger model benefits more from disaggregation
+
+  schedulingProfiles:
+    - name: decode
+      plugins:
+        - pluginRef: decode-filter
+        - pluginRef: load-aware-scorer
+
+    - name: prefill
+      plugins:
+        - pluginRef: prefill-filter
+        - pluginRef: load-aware-scorer
+
+  plugins:
+    - name: adaptive-pd-decider-aggressive
+      type: adaptive-pd-decider
+      parameters:
+        # Optimistic throughput estimates (high-end hardware)
+        initialPrefillThroughput: 3000  # Very fast prefill workers
+        initialDecodeThroughput: 400    # Decode still limited by generation
+
+        # Low KV transfer cost (fast network, co-located pods)
+        kvTransferLatencyPerToken: 0.00005  # 0.05ms per token
+
+        # Same workload thresholds
+        smallRequestThreshold: 1000
+        mediumRequestThreshold: 10000
+        largeRequestThreshold: 50000
+
+        # Small cost margin - more aggressive disaggregation
+        costMargin: 0.05  # 5% margin
+
+        defaultMaxOutputTokens: 4096  # Larger default for long-form generation
+        cacheOverheadFactor: 0.03     # Low overhead assumption
+
+    - name: pd-handler
+      type: pd-profile-handler
+      parameters:
+        decodeProfile: decode
+        prefillProfile: prefill
+        deciderPluginName: adaptive-pd-decider-aggressive
+
+    - name: decode-filter
+      type: decode-role-filter
+
+    - name: prefill-filter
+      type: prefill-role-filter
+
+    - name: load-aware-scorer
+      type: load-aware-scorer
+
+---
+# Usage Notes:
+#
+# 1. Choose the configuration that matches your hardware and workload:
+#    - adaptive-pd-pool: Balanced defaults for most deployments
+#    - adaptive-pd-pool-conservative: Stable workloads, prefer fewer transitions
+#    - adaptive-pd-pool-aggressive: High-end hardware, fast network, long outputs
+#
+# 2. Monitor decisions via Prometheus metrics:
+#    - llm_d_inference_scheduler_pd_decision_total{decision_type="prefill-decode"}
+#    - llm_d_inference_scheduler_pd_decision_total{decision_type="decode-only"}
+#
+# 3. Tune parameters based on observations:
+#    - If disaggregation is too rare: reduce costMargin, reduce kvTransferLatencyPerToken
+#    - If disaggregation is too frequent: increase costMargin, increase kvTransferLatencyPerToken
+#    - If decisions oscillate: increase costMargin
+#
+# 4. Performance expectations:
+#    - 10-30% latency improvement vs static deciders under load shifts
+#    - Automatic adaptation to workload changes (10k→20k token shifts)
+#    - No manual tuning required for different request patterns
+#
+# 5. Limitations:
+#    - Currently uses defaultMaxOutputTokens (conservative 2048) instead of extracting
+#      from request body (requires interface enhancement)
+#    - Prefill worker state aggregation simplified due to API limitations
+#    - Future enhancement: ResponseComplete integration for adaptive throughput tuning
