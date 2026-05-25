@@ -276,6 +276,7 @@ func (f *mockShardProcessorFactory) new(
 	_ time.Duration,
 	_ int,
 	_ logr.Logger,
+	_ internal.ProcessorOptions,
 ) shardProcessor {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1021,6 +1022,7 @@ func TestFlowController_WorkerManagement(t *testing.T) {
 			_ time.Duration,
 			_ int,
 			_ logr.Logger,
+			_ internal.ProcessorOptions,
 		) shardProcessor {
 			// This function is called by getOrStartWorker before the LoadOrStore check.
 			proc := &mockShardProcessor{runStarted: make(chan struct{})}

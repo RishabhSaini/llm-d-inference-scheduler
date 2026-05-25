@@ -30,6 +30,8 @@ const (
 	defaultProcessorReconciliationInterval = 5 * time.Second
 	// defaultEnqueueChannelBufferSize is the default size of a worker's incoming request buffer.
 	defaultEnqueueChannelBufferSize = 100
+	// defaultEvictionCooldown is the minimum interval between demand-driven eviction signals per priority band.
+	defaultEvictionCooldown = 100 * time.Millisecond
 )
 
 // Config holds the configuration for the `FlowController`.
@@ -53,6 +55,15 @@ type Config struct {
 	// serial execution loop and allowing the system to handle short bursts of traffic without blocking.
 	// Optional: Defaults to `defaultEnqueueChannelBufferSize` (100).
 	EnqueueChannelBufferSize int
+
+	// EnableEviction enables demand-driven in-flight eviction. When true and an EvictionHandler
+	// is set via SetEvictionHandler, ShardProcessors will emit eviction demands on HoL blocking.
+	EnableEviction bool
+
+	// EvictionCooldown is the minimum interval between demand-driven eviction demands for the same
+	// priority band. Only used when EnableEviction is true and an EvictionHandler is set.
+	// Optional: Defaults to `defaultEvictionCooldown` (100ms).
+	EvictionCooldown time.Duration
 }
 
 // ConfigOption is a functional option for configuring the FlowController.
@@ -60,10 +71,16 @@ type ConfigOption func(*Config)
 
 // NewConfigFromAPI creates a new Config from the API configuration.
 func NewConfigFromAPI(apiConfig *configapi.FlowControlConfig) (*Config, error) {
-	opts := make([]ConfigOption, 0, 1)
+	opts := make([]ConfigOption, 0, 3)
 	if apiConfig != nil {
 		if apiConfig.DefaultRequestTTL != nil {
 			opts = append(opts, WithDefaultRequestTTL(apiConfig.DefaultRequestTTL.Duration))
+		}
+		if apiConfig.EnableEviction {
+			opts = append(opts, WithEnableEviction(true))
+		}
+		if apiConfig.EvictionCooldown != nil {
+			opts = append(opts, WithEvictionCooldown(apiConfig.EvictionCooldown.Duration))
 		}
 	}
 	return NewConfig(opts...)
@@ -75,6 +92,7 @@ func NewConfig(opts ...ConfigOption) (*Config, error) {
 		ExpiryCleanupInterval:           defaultExpiryCleanupInterval,
 		ProcessorReconciliationInterval: defaultProcessorReconciliationInterval,
 		EnqueueChannelBufferSize:        defaultEnqueueChannelBufferSize,
+		EvictionCooldown:                defaultEvictionCooldown,
 	}
 
 	for _, opt := range opts {
@@ -115,6 +133,20 @@ func WithEnqueueChannelBufferSize(size int) ConfigOption {
 	}
 }
 
+// WithEnableEviction enables demand-driven in-flight eviction.
+func WithEnableEviction(enabled bool) ConfigOption {
+	return func(c *Config) {
+		c.EnableEviction = enabled
+	}
+}
+
+// WithEvictionCooldown sets the eviction cooldown interval.
+func WithEvictionCooldown(d time.Duration) ConfigOption {
+	return func(c *Config) {
+		c.EvictionCooldown = d
+	}
+}
+
 // validate checks the configuration for validity.
 func (c *Config) validate() error {
 	if c.DefaultRequestTTL < 0 {
@@ -128,6 +160,9 @@ func (c *Config) validate() error {
 	}
 	if c.EnqueueChannelBufferSize < 0 {
 		return fmt.Errorf("EnqueueChannelBufferSize cannot be negative, but got %d", c.EnqueueChannelBufferSize)
+	}
+	if c.EvictionCooldown < 0 {
+		return fmt.Errorf("EvictionCooldown cannot be negative, but got %v", c.EvictionCooldown)
 	}
 	return nil
 }

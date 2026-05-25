@@ -45,6 +45,7 @@ func TestNewConfig(t *testing.T) {
 				ExpiryCleanupInterval:           defaultExpiryCleanupInterval,
 				ProcessorReconciliationInterval: defaultProcessorReconciliationInterval,
 				EnqueueChannelBufferSize:        defaultEnqueueChannelBufferSize,
+				EvictionCooldown:                defaultEvictionCooldown,
 			},
 		},
 		{
@@ -58,6 +59,7 @@ func TestNewConfig(t *testing.T) {
 				ExpiryCleanupInterval:           defaultExpiryCleanupInterval,
 				ProcessorReconciliationInterval: defaultProcessorReconciliationInterval,
 				EnqueueChannelBufferSize:        defaultEnqueueChannelBufferSize,
+				EvictionCooldown:                defaultEvictionCooldown,
 			},
 		},
 		{
@@ -74,6 +76,7 @@ func TestNewConfig(t *testing.T) {
 				ExpiryCleanupInterval:           2 * time.Second,
 				ProcessorReconciliationInterval: 10 * time.Second,
 				EnqueueChannelBufferSize:        50,
+				EvictionCooldown:                defaultEvictionCooldown,
 			},
 		},
 		{

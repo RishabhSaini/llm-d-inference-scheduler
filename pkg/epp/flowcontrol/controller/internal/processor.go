@@ -31,6 +31,7 @@ import (
 	logutil "github.com/llm-d/llm-d-inference-scheduler/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/flowcontrol/contracts"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/flowcontrol/types"
+	requtil "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/common/request"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/flowcontrol"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/metrics"
 )
@@ -42,6 +43,17 @@ const maxCleanupWorkers = 4
 // ErrProcessorBusy is a sentinel error returned by the processor's Submit method indicating that the processor's.
 // internal buffer is momentarily full and cannot accept new work.
 var ErrProcessorBusy = errors.New("shard processor is busy")
+
+// ProcessorOptions holds optional behavioral hooks for the ShardProcessor.
+type ProcessorOptions struct {
+	// EvictionHandler handles demand-driven eviction when HoL blocking is detected with queued demand.
+	// If nil, demand-driven eviction is disabled.
+	EvictionHandler types.EvictionHandler
+
+	// EvictionCooldown is the minimum interval between eviction demands for the same priority band.
+	// Defaults to 100ms if zero.
+	EvictionCooldown time.Duration
+}
 
 // ShardProcessor is the core worker of the FlowController.
 //
@@ -84,6 +96,17 @@ type ShardProcessor struct {
 	wg             sync.WaitGroup
 	isShuttingDown atomic.Bool
 	shutdownOnce   sync.Once
+
+	// evictionHandler handles demand-driven eviction when HoL blocking is detected.
+	// If nil, demand-driven eviction is disabled.
+	evictionHandler types.EvictionHandler
+
+	// lastEvictionDemandTime tracks debounce state per priority band.
+	// Only accessed from the single-writer run loop.
+	lastEvictionDemandTime map[int]time.Time
+
+	// evictionCooldown is the minimum interval between eviction demands for the same priority band.
+	evictionCooldown time.Duration
 }
 
 // NewShardProcessor creates a new ShardProcessor instance.
@@ -98,18 +121,26 @@ func NewShardProcessor(
 	cleanupSweepInterval time.Duration,
 	enqueueChannelBufferSize int,
 	logger logr.Logger,
+	opts ProcessorOptions,
 ) *ShardProcessor {
+	cooldown := opts.EvictionCooldown
+	if cooldown == 0 {
+		cooldown = 100 * time.Millisecond
+	}
 	return &ShardProcessor{
-		shard:                shard,
-		poolName:             poolName,
-		saturationDetector:   saturationDetector,
-		endpointCandidates:   endpointCandidates,
-		usageLimitPolicy:     usageLimitPolicy,
-		clock:                clock,
-		cleanupSweepInterval: cleanupSweepInterval,
-		logger:               logger,
-		lifecycleCtx:         ctx,
-		enqueueChan:          make(chan *FlowItem, enqueueChannelBufferSize),
+		shard:                  shard,
+		poolName:               poolName,
+		saturationDetector:     saturationDetector,
+		endpointCandidates:     endpointCandidates,
+		usageLimitPolicy:       usageLimitPolicy,
+		clock:                  clock,
+		cleanupSweepInterval:   cleanupSweepInterval,
+		logger:                 logger,
+		lifecycleCtx:           ctx,
+		enqueueChan:            make(chan *FlowItem, enqueueChannelBufferSize),
+		evictionHandler:        opts.EvictionHandler,
+		lastEvictionDemandTime: make(map[int]time.Time),
+		evictionCooldown:       cooldown,
 	}
 }
 
@@ -341,6 +372,11 @@ func (sp *ShardProcessor) dispatchCycle(ctx context.Context) bool {
 		if saturation >= usageLimit {
 			sp.logger.V(logutil.DEBUG).Info("Priority band is saturated; enforcing HoL blocking.",
 				"priority", priority, "usageLimit", usageLimit)
+
+			if sp.evictionHandler != nil {
+				sp.requestEvictionIfNeeded(ctx, priority, saturation, usageLimit)
+			}
+
 			// Stop the dispatch cycle entirely to respect strict policy decision and prevent priority inversion where
 			// lower-priority work might exacerbate the saturation affecting high-priority work.
 			return false
@@ -372,6 +408,103 @@ func (sp *ShardProcessor) dispatchCycle(ctx context.Context) bool {
 		return true
 	}
 	return false
+}
+
+// requestEvictionIfNeeded checks if there is queued demand at the given priority band whose
+// tightest SLO/TTL deadline is at risk given the current overload level. If so, it asynchronously
+// invokes the eviction handler. Only called from the single-writer run loop.
+func (sp *ShardProcessor) requestEvictionIfNeeded(ctx context.Context, priority int, saturation, usageLimit float64) {
+	now := sp.clock.Now()
+
+	if lastTime, ok := sp.lastEvictionDemandTime[priority]; ok {
+		if now.Sub(lastTime) < sp.evictionCooldown {
+			return
+		}
+	}
+
+	band, err := sp.shard.PriorityBandAccessor(priority)
+	if err != nil {
+		return
+	}
+	queuedCount := 0
+	var tightestDeadline time.Time
+	var tightestEnqueueTime time.Time
+
+	band.IterateQueues(func(fqa flowcontrol.FlowQueueAccessor) bool {
+		queuedCount += fqa.Len()
+		head := fqa.PeekHead()
+		if head == nil {
+			return true
+		}
+		deadline := computeDeadline(head)
+		if deadline.IsZero() {
+			return true
+		}
+		if tightestDeadline.IsZero() || deadline.Before(tightestDeadline) {
+			tightestDeadline = deadline
+			tightestEnqueueTime = head.EnqueueTime()
+		}
+		return true
+	})
+
+	if queuedCount == 0 {
+		return
+	}
+
+	if tightestDeadline.IsZero() {
+		return
+	}
+
+	remaining := tightestDeadline.Sub(now)
+	elapsed := now.Sub(tightestEnqueueTime)
+	overloadRatio := saturation / usageLimit
+	estimatedWait := time.Duration(float64(elapsed) * overloadRatio)
+
+	if remaining > estimatedWait {
+		return
+	}
+
+	sp.lastEvictionDemandTime[priority] = now
+
+	demand := types.EvictionDemand{
+		BlockedPriority: priority,
+		QueuedCount:     queuedCount,
+		Saturation:      saturation,
+		UsageLimit:      usageLimit,
+		Remaining:       remaining,
+		EstimatedWait:   estimatedWait,
+	}
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				sp.logger.Error(nil, "Eviction handler panicked", "panic", r, "priority", priority)
+			}
+		}()
+		sp.evictionHandler.HandleEvictionDemand(ctx, demand)
+	}()
+
+	sp.logger.V(logutil.DEBUG).Info("Eviction demand emitted",
+		"priority", priority, "queuedCount", queuedCount,
+		"remaining", remaining, "estimatedWait", estimatedWait,
+		"saturation", saturation, "usageLimit", usageLimit)
+}
+
+// computeDeadline returns the SLO or TTL deadline for a queued item.
+// Priority: x-slo-ttft-ms header → enqueueTime + effectiveTTL → zero (no deadline).
+func computeDeadline(item flowcontrol.QueueItemAccessor) time.Time {
+	req := item.OriginalRequest()
+	if req != nil {
+		if infReq := req.InferenceRequest(); infReq != nil && infReq.Headers != nil {
+			if deadline, ok := requtil.ParseSLODeadline(infReq.Headers, req.ReceivedTimestamp()); ok {
+				return deadline
+			}
+		}
+	}
+	if ttl := item.EffectiveTTL(); ttl > 0 {
+		return item.EnqueueTime().Add(ttl)
+	}
+	return time.Time{}
 }
 
 // selectItem applies the configured fairness and ordering policies to select a single item.

@@ -66,6 +66,7 @@ type shardProcessorFactory func(
 	cleanupSweepInterval time.Duration,
 	enqueueChannelBufferSize int,
 	logger logr.Logger,
+	opts internal.ProcessorOptions,
 ) shardProcessor
 
 var _ shardProcessor = &internal.ShardProcessor{}
@@ -102,6 +103,11 @@ type FlowController struct {
 	clock                 clock.WithTicker
 	logger                logr.Logger
 	shardProcessorFactory shardProcessorFactory
+
+	// evictionHandler is set via SetEvictionHandler and read by getOrStartWorker.
+	// Uses sync.RWMutex for safe concurrent access since run() starts before the setter is called.
+	evictionMu      sync.RWMutex
+	evictionHandler types.EvictionHandler
 
 	// --- Lifecycle state ---
 
@@ -160,6 +166,7 @@ func NewFlowController(
 		cleanupSweepInterval time.Duration,
 		enqueueChannelBufferSize int,
 		logger logr.Logger,
+		opts internal.ProcessorOptions,
 	) shardProcessor {
 		return internal.NewShardProcessor(
 			ctx,
@@ -172,11 +179,20 @@ func NewFlowController(
 			cleanupSweepInterval,
 			enqueueChannelBufferSize,
 			logger,
+			opts,
 		)
 	}
 
 	go fc.run(ctx)
 	return fc, nil
+}
+
+// SetEvictionHandler sets the handler for demand-driven in-flight eviction.
+// When set, ShardProcessors will invoke it when HoL blocking is detected with queued demand.
+func (fc *FlowController) SetEvictionHandler(handler types.EvictionHandler) {
+	fc.evictionMu.Lock()
+	defer fc.evictionMu.Unlock()
+	fc.evictionHandler = handler
 }
 
 // run starts the FlowController's main reconciliation loop (supervisor loop).
@@ -451,6 +467,10 @@ func (fc *FlowController) getOrStartWorker(shard contracts.RegistryShard) *manag
 	}
 
 	// Construct a new worker, but do not start its goroutine yet.
+	fc.evictionMu.RLock()
+	handler := fc.evictionHandler
+	fc.evictionMu.RUnlock()
+
 	processorCtx, cancel := context.WithCancel(fc.parentCtx)
 	processor := fc.shardProcessorFactory(
 		processorCtx,
@@ -462,6 +482,10 @@ func (fc *FlowController) getOrStartWorker(shard contracts.RegistryShard) *manag
 		fc.config.ExpiryCleanupInterval,
 		fc.config.EnqueueChannelBufferSize,
 		fc.logger.WithValues("shardID", shard.ID()),
+		internal.ProcessorOptions{
+			EvictionHandler:  handler,
+			EvictionCooldown: fc.config.EvictionCooldown,
+		},
 	)
 	newWorker := &managedWorker{
 		processor: processor,

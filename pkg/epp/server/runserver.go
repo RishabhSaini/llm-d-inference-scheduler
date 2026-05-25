@@ -62,6 +62,7 @@ type ExtProcServerRunner struct {
 	Parser                           fwkrh.Parser
 	SaturationDetector               fwkfc.SaturationDetector
 	UseExperimentalDatalayerV2       bool // Pluggable data layer feature flag
+	EvictChannelLookup               handlers.EvictChannelLookup
 }
 
 // NewDefaultExtProcServerRunner creates a runner with default values.
@@ -180,6 +181,9 @@ func (r *ExtProcServerRunner) AsRunnable(logger logr.Logger) manager.Runnable {
 		}
 
 		extProcServer := handlers.NewStreamingServer(r.Datastore, r.Director, r.Parser)
+		if r.EvictChannelLookup != nil {
+			extProcServer.SetEvictChannelLookup(r.EvictChannelLookup)
+		}
 		extProcPb.RegisterExternalProcessorServer(srv, extProcServer)
 
 		if r.HealthChecking {

@@ -38,6 +38,7 @@ import (
 	logutil "github.com/llm-d/llm-d-inference-scheduler/pkg/common/observability/logging"
 	reqcommon "github.com/llm-d/llm-d-inference-scheduler/pkg/common/request"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/datalayer"
+	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/flowcontrol/eviction"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/datastore"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/flowcontrol/contracts"
 	fwkdl "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/datalayer"
@@ -87,6 +88,19 @@ func NewDirectorWithConfig(
 	}
 }
 
+// SetRequestEvictor sets the RequestEvictor for tracking and evicting in-flight requests.
+func (d *Director) SetRequestEvictor(re *eviction.RequestEvictor) {
+	d.requestEvictor = re
+}
+
+// EvictN attempts to evict up to n in-flight requests from model servers.
+func (d *Director) EvictN(ctx context.Context, n int) ([]string, error) {
+	if d.requestEvictor == nil {
+		return nil, nil
+	}
+	return d.requestEvictor.EvictN(ctx, n)
+}
+
 // responseBodyWork represents a unit of work to be processed by the async response body queue.
 type responseBodyWork struct {
 	ctx            context.Context
@@ -127,6 +141,8 @@ type Director struct {
 	// Each request gets a dedicated channel and goroutine to ensure chunks are
 	// processed in order while not blocking the streaming response path.
 	responseBodyQueues sync.Map
+
+	requestEvictor *eviction.RequestEvictor
 }
 
 // getInferenceObjective fetches the inferenceObjective from the datastore otherwise creates a new one based on reqCtx.
@@ -337,6 +353,10 @@ func (d *Director) prepareRequest(ctx context.Context, reqCtx *handlers.RequestC
 
 	d.runPreRequestPlugins(ctx, reqCtx.SchedulingRequest, result)
 
+	if d.requestEvictor != nil {
+		d.requestEvictor.PreRequest(ctx, reqCtx.SchedulingRequest, result)
+	}
+
 	return reqCtx, nil
 }
 
@@ -376,6 +396,15 @@ func (d *Director) HandleResponseHeader(ctx context.Context, reqCtx *handlers.Re
 func (d *Director) HandleResponseBody(ctx context.Context, reqCtx *handlers.RequestContext, endOfStream bool) *handlers.RequestContext {
 	logger := log.FromContext(ctx).WithValues("stage", "bodyChunk")
 	logger.V(logutil.TRACE).Info("Entering HandleResponseBodyChunk")
+
+	if endOfStream && d.requestEvictor != nil {
+		evictResponse := &fwkrc.Response{
+			RequestID:   reqCtx.Request.Headers[reqcommon.RequestIDHeaderKey],
+			EndOfStream: true,
+		}
+		d.requestEvictor.ResponseBody(ctx, reqCtx.SchedulingRequest, evictResponse, reqCtx.TargetPod)
+	}
+
 	if len(d.requestControlPlugins.responseStreamingPlugins) == 0 {
 		logger.V(logutil.TRACE).Info("Exiting HandleResponseBodyChunk")
 		return reqCtx

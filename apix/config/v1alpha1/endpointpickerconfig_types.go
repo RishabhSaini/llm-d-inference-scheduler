@@ -355,6 +355,19 @@ type FlowControlConfig struct {
 	// Must reference a named plugin instance defined in the top-level Plugins section.
 	// If omitted, a default static policy (threshold=1.0, no gating) is used.
 	UsageLimitPolicyPluginRef string `json:"usageLimitPolicyPluginRef,omitempty"`
+
+	// +optional
+	// EnableEviction enables demand-driven in-flight eviction. When enabled, the dispatch cycle
+	// will evict lower-priority in-flight requests when higher-priority requests are queued but
+	// cannot dispatch due to pool saturation.
+	// Defaults to false.
+	EnableEviction bool `json:"enableEviction,omitempty"`
+
+	// +optional
+	// EvictionCooldown is the minimum interval between eviction demands for the same priority band.
+	// Prevents the dispatch cycle from flooding the eviction handler.
+	// If omitted, defaults to 100ms.
+	EvictionCooldown *metav1.Duration `json:"evictionCooldown,omitempty"`
 }
 
 func (fcc *FlowControlConfig) String() string {
@@ -389,6 +402,14 @@ func (fcc *FlowControlConfig) String() string {
 
 	if fcc.UsageLimitPolicyPluginRef != "" {
 		parts = append(parts, "UsageLimitPolicyRef: "+fcc.UsageLimitPolicyPluginRef)
+	}
+
+	if fcc.EnableEviction {
+		parts = append(parts, "EnableEviction: true")
+	}
+
+	if fcc.EvictionCooldown != nil {
+		parts = append(parts, fmt.Sprintf("EvictionCooldown: %s", fcc.EvictionCooldown.Duration))
 	}
 
 	return "{" + strings.Join(parts, ", ") + "}"
