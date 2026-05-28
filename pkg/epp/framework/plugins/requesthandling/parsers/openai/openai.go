@@ -39,6 +39,7 @@ const (
 	chatCompletionsAPI = "chat/completions"
 	completionsAPI     = "completions"
 	embeddingsAPI      = "embeddings"
+	multimodalAPI = "multimodal"
 
 	streamingRespPrefix = "data: "
 	streamingEndMsg     = "data: [DONE]"
@@ -188,6 +189,9 @@ func determineAPITypeFromPath(path string) string {
 	if strings.HasSuffix(path, "/embeddings") {
 		return embeddingsAPI
 	}
+	if strings.Contains(path, "/audio/") || strings.Contains(path, "/images/") || strings.Contains(path, "/videos") || strings.Contains(path, "/omni/") {
+		return multimodalAPI
+	}
 
 	// Default to completions API for backward compatibility with existing clients and integration tests
 	return completionsAPI
@@ -236,6 +240,14 @@ func extractRequestBody(rawBody []byte, headers map[string]string) (*fwkrh.Infer
 			return &fwkrh.InferenceRequestBody{Embeddings: &embeddings}, nil
 		}
 		return nil, errors.New("invalid embeddings request: must have input field")
+
+	case multimodalAPI:
+		// Multimodal endpoints (audio/speech, images/generations, videos, etc.)
+		// carry a model field for routing but do not follow the completions/chat
+		// request schema. Parse as a raw payload so the scheduler can still
+		// route by model name.
+		return &fwkrh.InferenceRequestBody{}, nil
+
 	default:
 		return nil, errors.New("unsupported API endpoint")
 	}
