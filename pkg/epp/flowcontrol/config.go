@@ -24,7 +24,14 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 )
 
-const FeatureGate = "flowControl"
+const (
+	FeatureGate = "flowControl"
+
+	// DisableFeatureGate is the opt-out gate for Flow Control. When the feature
+	// graduates to default-on, setting this gate restores the legacy admission
+	// controller. Currently a no-op; wired during graduation.
+	DisableFeatureGate = "disableFlowControl"
+)
 
 // Config is the top-level configuration for the entire flow control module.
 // It embeds the configurations for the controller and the registry, providing a single point of entry for validation
