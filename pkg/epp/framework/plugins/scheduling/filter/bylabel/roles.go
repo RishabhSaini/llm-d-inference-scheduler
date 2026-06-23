@@ -35,6 +35,16 @@ const (
 	PrefillRoleType = "prefill-filter"
 	// EncodeRoleType is the type of the EncodeFilter
 	EncodeRoleType = "encode-filter"
+
+	// RoleTalker set for designated talker workers
+	RoleTalker = "talker"
+	// RoleCode2Wav set for designated code2wav workers
+	RoleCode2Wav = "code2wav"
+
+	// TalkerRoleType is the type of the TalkerFilter
+	TalkerRoleType = "talker-filter"
+	// Code2WavRoleType is the type of the Code2WavFilter
+	Code2WavRoleType = "code2wav-filter"
 )
 
 // DecodeRoleFactory defines the factory function for the Decode filter.
@@ -67,4 +77,24 @@ func EncodeRoleFactory(name string, _ *json.Decoder, _ plugin.Handle) (plugin.Pl
 // Accepts pods with roles: encode, encode-prefill, or encode-prefill-decode.
 func NewEncodeRole() *ByLabel {
 	return NewByLabel(EncodeRoleType, RoleLabel, false, RoleEncode, RoleEncodePrefill, RoleEncodePrefillDecode)
+}
+
+// TalkerRoleFactory defines the factory function for the Talker filter.
+func TalkerRoleFactory(name string, _ *json.Decoder, _ plugin.Handle) (plugin.Plugin, error) {
+	return NewTalkerRole().WithName(name), nil
+}
+
+// NewTalkerRole creates and returns an instance of the Filter configured for talker role.
+func NewTalkerRole() *ByLabel {
+	return NewByLabel(TalkerRoleType, RoleLabel, false, RoleTalker)
+}
+
+// Code2WavRoleFactory defines the factory function for the Code2Wav filter.
+func Code2WavRoleFactory(name string, _ *json.Decoder, _ plugin.Handle) (plugin.Plugin, error) {
+	return NewCode2WavRole().WithName(name), nil
+}
+
+// NewCode2WavRole creates and returns an instance of the Filter configured for code2wav role.
+func NewCode2WavRole() *ByLabel {
+	return NewByLabel(Code2WavRoleType, RoleLabel, false, RoleCode2Wav)
 }

@@ -1,0 +1,43 @@
+# Sample EPP configuration for disaggregated omni-modal serving
+# (thinker -> talker -> code2wav pipeline, e.g. Qwen3-Omni)
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: thinker-filter
+- type: talker-filter
+- type: code2wav-filter
+- type: prefix-cache-scorer
+- type: kv-cache-utilization-scorer
+- type: queue-scorer
+- type: running-requests-size-scorer
+- type: max-score-picker
+- type: passthrough-parser
+schedulingProfiles:
+- name: thinker
+  plugins:
+  - pluginRef: thinker-filter
+  - pluginRef: max-score-picker
+  - pluginRef: prefix-cache-scorer
+    weight: 3
+  - pluginRef: kv-cache-utilization-scorer
+    weight: 2
+  - pluginRef: queue-scorer
+    weight: 1
+- name: talker
+  plugins:
+  - pluginRef: talker-filter
+  - pluginRef: max-score-picker
+  - pluginRef: kv-cache-utilization-scorer
+    weight: 2
+  - pluginRef: queue-scorer
+    weight: 2
+- name: code2wav
+  plugins:
+  - pluginRef: code2wav-filter
+  - pluginRef: max-score-picker
+  - pluginRef: queue-scorer
+    weight: 2
+  - pluginRef: running-requests-size-scorer
+    weight: 1
+requestHandler:
+  parser: passthrough-parser
