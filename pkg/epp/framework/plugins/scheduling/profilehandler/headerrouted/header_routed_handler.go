@@ -58,24 +58,23 @@ func (h *Handler) WithName(name string) *Handler {
 
 func (h *Handler) Pick(_ context.Context, request *fwksched.InferenceRequest, profiles map[string]fwksched.SchedulerProfile,
 	profileResults map[string]*fwksched.ProfileRunResult) map[string]fwksched.SchedulerProfile {
-	if len(profiles) == len(profileResults) {
-		return map[string]fwksched.SchedulerProfile{}
-	}
-
 	profileName := h.defaultProfile
 	if request != nil && request.Headers != nil {
-		// Headers are lowercased by the ext_proc handler.
 		lowerKey := strings.ToLower(h.headerKey)
 		if phase, ok := request.Headers[lowerKey]; ok && phase != "" {
 			profileName = phase
 		}
 	}
 
+	if _, alreadyRun := profileResults[profileName]; alreadyRun {
+		return map[string]fwksched.SchedulerProfile{}
+	}
+
 	if profile, ok := profiles[profileName]; ok {
 		return map[string]fwksched.SchedulerProfile{profileName: profile}
 	}
 
-	return profiles
+	return map[string]fwksched.SchedulerProfile{}
 }
 
 func (h *Handler) ProcessResults(_ context.Context, _ *fwksched.InferenceRequest,
