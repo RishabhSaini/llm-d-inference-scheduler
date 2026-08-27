@@ -24,7 +24,7 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
   exit 1
 fi
 
-export VLLM_CHART_DIR="${VLLM_CHART_DIR:-../llm-d-kv-cache-manager/vllm-setup-helm}"
+export VLLM_CHART_DIR="${VLLM_CHART_DIR:-../llm-d-kv-cache/vllm-setup-helm}"
 # Check that Chart.yaml exists
 if [[ ! -f "$VLLM_CHART_DIR/Chart.yaml" ]]; then
   echo "Chart.yaml not found in $VLLM_CHART_DIR"
@@ -71,11 +71,11 @@ export POOL_NAME="${POOL_NAME:-${MODEL_NAME_SAFE}-inference-pool}"
 # Endpoint Picker (EPP) deployment name
 export EPP_NAME="${EPP_NAME:-${MODEL_NAME_SAFE}-endpoint-picker}"
 
-# EPP container image name
-export EPP_IMAGE="${EPP_IMAGE:-${IMAGE_REGISTRY}/llm-d-inference-scheduler}"
-
 # EPP image tag
 export EPP_TAG="${EPP_TAG:-v0.1.0}"
+
+# EPP container image (full reference including tag)
+export EPP_IMAGE="${EPP_IMAGE:-${IMAGE_REGISTRY}/llm-d-router-endpoint-picker:${EPP_TAG}}"
 
 # Whether P/D mode is enabled for this deployment
 export PD_ENABLED="\"${PD_ENABLED:-false}\""
@@ -153,7 +153,7 @@ if [[ "$CLEAN" == "true" ]]; then
   # Delete the ConfigMAp created for the EPP configuration
   kubectl -n "${NAMESPACE}" delete --ignore-not-found=true ConfigMap epp-config
   # Delete inference schedulare and gateway resources.
-  kustomize build deploy/environments/dev/kubernetes-kgateway | envsubst | kubectl -n "${NAMESPACE}" delete --ignore-not-found=true -f -
+  kubectl kustomize deploy/environments/dev/kubernetes-kgateway | envsubst | kubectl -n "${NAMESPACE}" delete --ignore-not-found=true -f -
   # Delete vllm resources.
   helm uninstall vllm --namespace ${NAMESPACE} --ignore-not-found
   exit 0
@@ -193,7 +193,7 @@ helm upgrade --install "$VLLM_HELM_RELEASE_NAME" "$VLLM_CHART_DIR" \
 
 echo "INFO: Deploying Gateway Environment in namespace ${NAMESPACE}, ${POOL_NAME}"
 kubectl -n "${NAMESPACE}" create configmap epp-config --from-file=epp-config.yaml=<(envsubst < "${EPP_CONFIG}") --dry-run=client -o yaml | kubectl apply -f -
-kustomize build deploy/environments/dev/kubernetes-kgateway | envsubst | kubectl -n "${NAMESPACE}" apply -f -
+kubectl kustomize deploy/environments/dev/kubernetes-kgateway | envsubst | kubectl -n "${NAMESPACE}" apply -f -
 echo "INFO: Waiting for resources in namespace ${NAMESPACE} to become ready"
 # Wait for gateway resources
 kubectl -n "${NAMESPACE}" wait deployment/${EPP_NAME} --for=condition=Available --timeout=60s

@@ -1,0 +1,47 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package config
+
+import (
+	"fmt"
+
+	"github.com/llm-d/llm-d-router/pkg/epp/datalayer"
+	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol"
+	fwkfc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
+	"github.com/llm-d/llm-d-router/pkg/epp/handlers"
+	"github.com/llm-d/llm-d-router/pkg/epp/scheduling"
+)
+
+// Config is the configuration loaded from the text based configuration
+type Config struct {
+	SchedulerConfig    *scheduling.SchedulerConfig
+	SaturationDetector fwkfc.SaturationDetector
+	DataConfig         *datalayer.Config
+	FlowControlConfig  *flowcontrol.Config
+	ParserRegistry     *handlers.ParserRegistry
+}
+
+func (c *Config) String() string {
+	if c == nil {
+		return "<nil>"
+	}
+	// Define a local type definition to prevent infinite recursion when calling Sprintf("%+v").
+	// A new type definition inherits the struct fields but does not copy its methods,
+	// bypassing the Stringer check and allowing a safe reflection-based field dump.
+	type temp Config
+	return fmt.Sprintf("%+v", temp(*c))
+}

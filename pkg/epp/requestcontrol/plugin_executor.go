@@ -1,0 +1,86 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package requestcontrol
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/llm-d/llm-d-router/pkg/epp/datalayer"
+	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
+	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/metrics"
+)
+
+// executePluginsAsDAG executes DataProducer plugins as a DAG based on their dependencies asynchronously.
+// So, a plugin is executed only after all its dependencies have been executed.
+// If there is a cycle or any plugin fails with error, it returns an error.
+func executePluginsAsDAG(ctx context.Context, plugins []fwkrc.DataProducer, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) error {
+	logger := log.FromContext(ctx)
+	for _, plugin := range plugins {
+		scoped, violations := datalayer.Scope(logger, fwkrc.DataProducerExtensionPoint, plugin, endpoints)
+		before := time.Now()
+		err := plugin.Produce(ctx, request, scoped)
+		metrics.RecordPluginProcessingLatency(fwkrc.DataProducerExtensionPoint, plugin.TypedName().Type, plugin.TypedName().Name, time.Since(before))
+		if err != nil {
+			return fmt.Errorf("DataProducer %q failed: %w", plugin.TypedName().String(), err)
+		}
+		if err := violations.Write(); err != nil {
+			return fmt.Errorf("DataProducer %q failed: %w", plugin.TypedName().String(), err)
+		}
+	}
+	return nil
+}
+
+// producerTimeout returns the producer's declared timeout when it implements
+// TimeoutAwareProducer with a positive value, otherwise dataProducerTimeout.
+func producerTimeout(p fwkrc.DataProducer) time.Duration {
+	if tp, ok := p.(fwkrc.TimeoutAwareProducer); ok {
+		if t := tp.ProduceTimeout(); t > 0 {
+			return t
+		}
+	}
+	return dataProducerTimeout
+}
+
+// dataProducerPluginsWithTimeout executes DataProducer plugins with a timeout.
+// The child context is cancelled when the timeout fires so plugins can observe cancellation
+// (e.g. abort outbound HTTP calls) and avoid committing state after the director has moved on.
+func dataProducerPluginsWithTimeout(ctx context.Context, timeout time.Duration, plugins []fwkrc.DataProducer,
+	request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- executePluginsAsDAG(ctx, plugins, request, endpoints)
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("DataProducer execution timed out: %w", ctx.Err())
+		}
+		return ctx.Err()
+	}
+}

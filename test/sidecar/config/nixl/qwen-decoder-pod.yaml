@@ -4,7 +4,7 @@ metadata:
   name: qwen-decoder
   labels:
     app: qwen-decoder
-    llm-d.ai/inferenceServing: "true"
+    llm-d.ai/inference-serving: "true"
     llm-d.ai/model: "qwen2-0-5b"
     llm-d.ai/role: "decode"
 spec:
@@ -25,7 +25,6 @@ spec:
         runAsNonRoot: true
       args:
         - "-port=8000"
-        - "-vllm-port=8200"
         - "-connector=nixlv2"
         - "-v=6"
       ports:
@@ -58,13 +57,13 @@ spec:
             fieldRef:
               fieldPath: status.podIP
         - name: VLLM_NIXL_SIDE_CHANNEL_PORT
-          value: "5557"
+          value: "5600"
         - name: HF_HUB_CACHE
           value: /vllm-workspace/models
         - name: VLLM_LOGGING_LEVEL
           value: DEBUG
       ports:
-        - containerPort: 5557
+        - containerPort: 5600
           protocol: TCP
       volumeMounts:
         - name: model-cache

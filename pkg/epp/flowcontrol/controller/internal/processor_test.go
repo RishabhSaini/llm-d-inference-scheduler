@@ -1,0 +1,1963 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package internal
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/go-logr/logr"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	testclock "k8s.io/utils/clock/testing"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts"
+	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts/mocks"
+	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/types"
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
+	fwkfcmocks "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol/mocks"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/usagelimits"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
+)
+
+const (
+	testTTL = 1 * time.Minute
+	// testNoEndpointTTL matches testTTL so that harness defaults leave the two regimes indistinguishable; tests that
+	// exercise the split set processor.noEndpointRequestTTL explicitly.
+	testNoEndpointTTL = 1 * time.Minute
+	testShortTTL      = 20 * time.Millisecond
+	testCleanupTick   = 10 * time.Millisecond
+	testWaitTimeout   = 1 * time.Second
+)
+
+var testFlow = flowcontrol.FlowKey{ID: "flow-a", Priority: 10}
+
+// TestMain sets up the logger for all tests in the package.
+func TestMain(m *testing.M) {
+	log.SetLogger(zap.New(zap.WriteTo(os.Stderr), zap.UseDevMode(true)))
+	os.Exit(m.Run())
+}
+
+type mockSaturationDetector struct {
+	flowcontrol.SaturationDetector
+	SaturationFunc func(ctx context.Context, candidatePods []fwkdl.Endpoint) float64
+}
+
+func (m *mockSaturationDetector) Saturation(ctx context.Context, candidatePods []fwkdl.Endpoint) float64 {
+	if m.SaturationFunc != nil {
+		return m.SaturationFunc(ctx, candidatePods)
+	}
+	return 0.0
+}
+
+// testHarness provides a unified, mock-based testing environment for the Processor. It centralizes all mock state
+// and provides helper methods for setting up tests and managing the processor's lifecycle.
+type testHarness struct {
+	t *testing.T
+	*mocks.MockRegistryDataPlane
+
+	// Concurrency and Lifecycle
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	startSignal chan struct{}
+
+	// Core components under test
+	processor          *Processor
+	clock              *testclock.FakeClock
+	logger             logr.Logger
+	saturationDetector *mockSaturationDetector
+	endpointCandidates *mocks.MockEndpointCandidates
+
+	// --- Centralized Mock State ---
+	// The harness's mutex protects the single source of truth for all mock state.
+	mu            sync.Mutex
+	queues        map[flowcontrol.FlowKey]*mocks.MockManagedQueue
+	priorityFlows map[int][]flowcontrol.FlowKey // Key: `priority`
+
+	// Customizable policy logic for tests to override.
+	fairnessPolicyPick func(context.Context, flowcontrol.PriorityBandAccessor) (flowcontrol.FlowQueueAccessor, error)
+}
+
+// newTestHarness creates and wires up a complete testing harness.
+func newTestHarness(t *testing.T, expiryCleanupInterval time.Duration) *testHarness {
+	t.Helper()
+	h := &testHarness{
+		t:                     t,
+		MockRegistryDataPlane: &mocks.MockRegistryDataPlane{},
+		clock:                 testclock.NewFakeClock(time.Now()),
+		logger:                logr.Discard(),
+		saturationDetector:    &mockSaturationDetector{},
+		endpointCandidates:    &mocks.MockEndpointCandidates{Candidates: []fwkdl.Endpoint{fwkdl.NewEndpoint(nil, nil)}},
+		startSignal:           make(chan struct{}),
+		queues:                make(map[flowcontrol.FlowKey]*mocks.MockManagedQueue),
+		priorityFlows:         make(map[int][]flowcontrol.FlowKey),
+	}
+	h.ctx, h.cancel = context.WithCancel(context.Background())
+
+	// Wire up the harness to provide the mock implementations for the processor's dependencies.
+	h.ManagedQueueFunc = h.managedQueue
+	h.AllOrderedPriorityLevelsFunc = h.allOrderedPriorityLevels
+	h.PriorityBandAccessorFunc = h.priorityBandAccessor
+	h.FairnessPolicyFunc = h.fairnessPolicy
+
+	// Provide a default capacity snapshot that is effectively infinite.
+	h.CapacitySnapshotFunc = func(int) (contracts.CapacitySnapshot, error) {
+		return contracts.CapacitySnapshot{
+			Global: contracts.CapacityDimension{CapacityBytes: 1e9},
+			Band:   contracts.CapacityDimension{CapacityBytes: 1e9},
+		}, nil
+	}
+
+	h.processor = NewProcessor(
+		h.ctx,
+		"test-pool",
+		h,
+		nil,
+		h.saturationDetector,
+		h.endpointCandidates,
+		usagelimits.DefaultPolicy(),
+		h.clock,
+		testNoEndpointTTL,
+		expiryCleanupInterval,
+		100,
+		h.logger,
+		nil)
+	require.NotNil(t, h.processor, "NewProcessor should not return nil")
+
+	t.Cleanup(func() { h.Stop() })
+
+	return h
+}
+
+// --- Test Lifecycle and Helpers ---
+
+// Start prepares the processor to run in a background goroutine but pauses it until Go() is called.
+func (h *testHarness) Start() {
+	h.t.Helper()
+	h.ctx, h.cancel = context.WithCancel(context.Background())
+	h.wg.Go(func() {
+		<-h.startSignal // Wait for the signal to begin execution.
+		h.processor.Run(h.ctx)
+	})
+}
+
+// Go unpauses the processor's main Run loop.
+func (h *testHarness) Go() {
+	h.t.Helper()
+	close(h.startSignal)
+}
+
+// Stop gracefully shuts down the processor and waits for it to terminate.
+func (h *testHarness) Stop() {
+	h.t.Helper()
+	if h.cancel != nil {
+		h.cancel()
+	}
+	h.wg.Wait()
+}
+
+// waitForFinalization blocks until an item is finalized or a timeout is reached.
+func (h *testHarness) waitForFinalization(item *FlowItem) (types.QueueOutcome, error) {
+	h.t.Helper()
+	select {
+	case finalState := <-item.Done():
+		return finalState.Outcome, finalState.Err
+	case <-time.After(testWaitTimeout):
+		h.t.Fatalf("Timed out waiting for item %q to be finalized", item.OriginalRequest().ID())
+		return types.QueueOutcomeNotYetFinalized, nil
+	}
+}
+
+// newTestItem creates a new FlowItem for testing purposes.
+func (h *testHarness) newTestItem(id string, key flowcontrol.FlowKey, ttl time.Duration) *FlowItem {
+	h.t.Helper()
+	req := fwkfcmocks.NewMockFlowControlRequest(100, id, key)
+	return NewItem(req, ttl, h.clock.Now())
+}
+
+// addQueue centrally registers a new mock queue for a given flow, ensuring all harness components are aware of it.
+func (h *testHarness) addQueue(key flowcontrol.FlowKey) *mocks.MockManagedQueue {
+	h.t.Helper()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	mockQueue := &mocks.MockManagedQueue{FlowKeyV: key}
+	h.queues[key] = mockQueue
+	h.priorityFlows[key.Priority] = append(h.priorityFlows[key.Priority], key)
+	return mockQueue
+}
+
+// --- Mock Interface Implementations ---
+
+// managedQueue provides the mock implementation for the `registry data-plane` interface.
+func (h *testHarness) managedQueue(key flowcontrol.FlowKey) (contracts.ManagedQueue, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if q, ok := h.queues[key]; ok {
+		return q, nil
+	}
+	return nil, fmt.Errorf("test setup error: no queue for %q", key)
+}
+
+// allOrderedPriorityLevels provides the mock implementation for the `registry data-plane` interface.
+func (h *testHarness) allOrderedPriorityLevels() []int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	prios := make([]int, 0, len(h.priorityFlows))
+	for p := range h.priorityFlows {
+		prios = append(prios, p)
+	}
+	sort.Slice(prios, func(i, j int) bool {
+		return prios[i] > prios[j]
+	})
+
+	return prios
+}
+
+// priorityBandAccessor provides the mock implementation for the `registry data-plane` interface. It acts as a factory for a
+// fully-configured, stateless mock that is safe for concurrent use.
+func (h *testHarness) priorityBandAccessor(p int) (flowcontrol.PriorityBandAccessor, error) {
+	band := &fwkfcmocks.MockPriorityBandAccessor{PriorityV: p}
+
+	// Safely get a snapshot of the flow IDs under a lock.
+	h.mu.Lock()
+	flowKeysForPriority := h.priorityFlows[p]
+	h.mu.Unlock()
+
+	// Configure the mock's behavior with a closure that reads from the harness's centralized, thread-safe state.
+	band.IterateQueuesFunc = func(cb func(fqa flowcontrol.FlowQueueAccessor) bool) {
+		// This closure safely iterates over the snapshot of flow IDs.
+		for _, key := range flowKeysForPriority {
+			// Get the queue using the thread-safe `managedQueue` method.
+			q, err := h.managedQueue(key)
+			if err == nil && q != nil {
+				mq := q.(*mocks.MockManagedQueue)
+				if !cb(mq.FlowQueueAccessor()) {
+					break
+				}
+			}
+		}
+	}
+	return band, nil
+}
+
+// fairnessPolicy provides the mock implementation for the registry data-plane interface.
+func (h *testHarness) fairnessPolicy(p int) (flowcontrol.FairnessPolicy, error) {
+	policy := &fwkfcmocks.MockFairnessPolicy{}
+	// If the test provided a custom implementation, use it.
+	if h.fairnessPolicyPick != nil {
+		policy.PickFunc = h.fairnessPolicyPick
+		return policy, nil
+	}
+
+	// Otherwise, use a default implementation that selects the first non-empty queue.
+	policy.PickFunc = func(
+		_ context.Context,
+		flowGroup flowcontrol.PriorityBandAccessor,
+	) (flowcontrol.FlowQueueAccessor, error) {
+		var selectedQueue flowcontrol.FlowQueueAccessor
+		flowGroup.IterateQueues(func(fqa flowcontrol.FlowQueueAccessor) bool {
+			if fqa.Len() > 0 {
+				selectedQueue = fqa
+				return false // stop iterating
+			}
+			return true // continue
+		})
+		return selectedQueue, nil
+	}
+	return policy, nil
+}
+
+// TestProcessor contains all tests for the `Processor`.
+func TestProcessor(t *testing.T) {
+	t.Parallel()
+
+	// Integration tests use the processor's main `Run` loop to verify the complete end-to-end lifecycle of a request, from
+	// `Enqueue` to its final outcome.
+	t.Run("Integration", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("should dispatch item successfully", func(t *testing.T) {
+			t.Parallel()
+			// --- ARRANGE ---
+			h := newTestHarness(t, testCleanupTick)
+			item := h.newTestItem("req-dispatch-success", testFlow, testTTL)
+			h.addQueue(testFlow)
+
+			// --- ACT ---
+			h.Start()
+			require.NoError(t, h.processor.Submit(item), "precondition: Submit should not fail")
+			h.Go()
+
+			// --- ASSERT ---
+			outcome, err := h.waitForFinalization(item)
+			assert.Equal(t, types.QueueOutcomeDispatched, outcome, "The final outcome should be Dispatched")
+			require.NoError(t, err, "A successful dispatch should not produce an error")
+		})
+
+		t.Run("should reject item when at capacity", func(t *testing.T) {
+			t.Parallel()
+			// --- ARRANGE ---
+			h := newTestHarness(t, testCleanupTick)
+			item := h.newTestItem("req-capacity-reject", testFlow, testTTL)
+			h.addQueue(testFlow)
+			h.CapacitySnapshotFunc = func(int) (contracts.CapacitySnapshot, error) {
+				return contracts.CapacitySnapshot{
+					Band: contracts.CapacityDimension{CapacityBytes: 50}, // 50 is less than item size of 100
+				}, nil
+			}
+
+			// --- ACT ---
+			h.Start()
+			require.NoError(t, h.processor.Submit(item), "precondition: Submit should not fail")
+			h.Go()
+
+			// --- ASSERT ---
+			outcome, err := h.waitForFinalization(item)
+			assert.Equal(t, types.QueueOutcomeRejectedCapacity, outcome, "The final outcome should be RejectedCapacity")
+			require.Error(t, err, "A capacity rejection should produce an error")
+			assert.ErrorIs(t, err, types.ErrQueueAtCapacity, "The error should be of type ErrQueueAtCapacity")
+		})
+
+		t.Run("should reject item on registry lookup failure", func(t *testing.T) {
+			t.Parallel()
+			// --- ARRANGE ---
+			h := newTestHarness(t, testCleanupTick)
+			item := h.newTestItem("req-lookup-fail-reject", testFlow, testTTL)
+			registryErr := errors.New("test registry lookup error")
+			h.ManagedQueueFunc = func(flowcontrol.FlowKey) (contracts.ManagedQueue, error) {
+				return nil, registryErr
+			}
+
+			// --- ACT ---
+			h.Start()
+			defer h.Stop()
+			require.NoError(t, h.processor.Submit(item), "precondition: Submit should not fail")
+			h.Go()
+
+			// --- ASSERT ---
+			outcome, err := h.waitForFinalization(item)
+			assert.Equal(t, types.QueueOutcomeRejectedOther, outcome, "The final outcome should be RejectedOther")
+			require.Error(t, err, "A rejection from a registry failure should produce an error")
+			assert.ErrorIs(t, err, registryErr, "The underlying registry error should be preserved")
+		})
+
+		t.Run("should reject item if enqueued during shutdown", func(t *testing.T) {
+			t.Parallel()
+			// --- ARRANGE ---
+			h := newTestHarness(t, testCleanupTick)
+			item := h.newTestItem("req-shutdown-reject", testFlow, testTTL)
+			h.addQueue(testFlow)
+
+			// --- ACT ---
+			h.Start()
+			h.Go()
+			h.Stop() // Stop the processor, then immediately try to enqueue.
+			require.ErrorIs(t, h.processor.Submit(item), types.ErrFlowControllerNotRunning,
+				"Submit should return ErrFlowControllerNotRunning on shutdown")
+
+			// --- ASSERT ---
+			assert.Nil(t, item.FinalState(), "Item should not be finalized by the processor")
+		})
+
+		t.Run("should evict a queued item on shutdown", func(t *testing.T) {
+			t.Parallel()
+			// --- ARRANGE ---
+			h := newTestHarness(t, testCleanupTick)
+			item := h.newTestItem("req-shutdown-evict", testFlow, testTTL)
+			mockQueue := h.addQueue(testFlow)
+			require.NoError(t, mockQueue.Add(item), "Adding item to mock queue should not fail")
+
+			// Prevent dispatch to ensure we test shutdown eviction, not a successful dispatch.
+			h.fairnessPolicyPick = func(
+				context.Context,
+				flowcontrol.PriorityBandAccessor,
+			) (flowcontrol.FlowQueueAccessor, error) {
+				return nil, errors.New("sentinel no item selected")
+			}
+
+			// --- ACT ---
+			h.Start()
+			h.Go()
+			h.Stop() // Stop immediately to trigger eviction.
+
+			// --- ASSERT ---
+			outcome, err := h.waitForFinalization(item)
+			assert.Equal(t, types.QueueOutcomeEvictedOther, outcome, "The outcome should be EvictedOther")
+			require.Error(t, err, "An eviction on shutdown should produce an error")
+			assert.ErrorIs(t, err, types.ErrFlowControllerNotRunning,
+				"The error should be of type ErrFlowControllerNotRunning")
+		})
+
+		t.Run("should handle concurrent enqueues and dispatch all items", func(t *testing.T) {
+			t.Parallel()
+			// --- ARRANGE ---
+			h := newTestHarness(t, testCleanupTick)
+			const numConcurrentItems = 20
+			q := h.addQueue(testFlow)
+			itemsToTest := make([]*FlowItem, 0, numConcurrentItems)
+			for i := range numConcurrentItems {
+				item := h.newTestItem(fmt.Sprintf("req-concurrent-%d", i), testFlow, testTTL)
+				itemsToTest = append(itemsToTest, item)
+			}
+
+			// --- ACT ---
+			h.Start()
+			defer h.Stop()
+			var wg sync.WaitGroup
+			for _, item := range itemsToTest {
+				wg.Add(1)
+				go func(fi *FlowItem) {
+					defer wg.Done()
+					require.NoError(t, h.processor.Submit(fi), "Submit should not fail")
+				}(item)
+			}
+			h.Go()
+			wg.Wait() // Wait for all enqueues to finish.
+
+			// --- ASSERT ---
+			for _, item := range itemsToTest {
+				outcome, err := h.waitForFinalization(item)
+				assert.Equal(t, types.QueueOutcomeDispatched, outcome,
+					"Item %q should have been dispatched", item.OriginalRequest().ID())
+				assert.NoError(t, err,
+					"A successful dispatch of item %q should not produce an error", item.OriginalRequest().ID())
+			}
+			assert.Equal(t, 0, q.Len(), "The mock queue should be empty at the end of the test")
+		})
+
+		t.Run("should guarantee exactly-once finalization during dispatch vs. expiry race", func(t *testing.T) {
+			t.Parallel()
+
+			// --- ARRANGE ---
+			h := newTestHarness(t, 1*time.Hour) // Disable background cleanup to isolate the race.
+			item := h.newTestItem("req-race", testFlow, testShortTTL)
+			q := h.addQueue(testFlow)
+
+			// Use channels to pause the dispatch cycle right before it would remove the item.
+			policyCanProceed := make(chan struct{})
+			itemIsBeingDispatched := make(chan struct{})
+			var signalOnce sync.Once
+			var removedItem flowcontrol.QueueItemAccessor
+
+			require.NoError(t, q.Add(item)) // Add the item directly to the queue.
+
+			// Override the queue's `RemoveFunc` to pause the dispatch goroutine at a critical moment.
+			q.RemoveFunc = func(h flowcontrol.QueueItemHandle) (flowcontrol.QueueItemAccessor, error) {
+				var err error
+				signalOnce.Do(func() {
+					removedItem = item
+					close(itemIsBeingDispatched) // 1. Signal that dispatch is happening.
+					<-policyCanProceed           // 2. Wait for the test to tell us to continue.
+					// 4. After we unblock, the item will have already been finalized by the cleanup logic.
+					// We simulate the item no longer being found.
+					err = fmt.Errorf("item with handle %v not found", h)
+				})
+				if removedItem == item {
+					return item, nil // Return the item on the first call
+				}
+				return nil, err // Return error on subsequent calls
+			}
+
+			// --- ACT ---
+			h.Start()
+			defer h.Stop()
+			h.Go()
+
+			// Advance the test clock in small increments until the item is being dispatched or timeout
+			// This is a more reliable way to ensure the processor has started and run the dispatch cycle
+			timeout := time.After(testWaitTimeout)
+			ticker := time.NewTicker(1 * time.Millisecond)
+			defer ticker.Stop()
+
+			dispatched := false
+			for !dispatched {
+				select {
+				case <-itemIsBeingDispatched:
+					dispatched = true
+				case <-timeout:
+					t.Fatal("Timed out waiting for item to be dispatched")
+				case <-ticker.C:
+					// Advance the test clock to trigger the dispatch ticker
+					h.clock.Step(1 * time.Millisecond)
+				}
+			}
+
+			// 3. The dispatch goroutine is now paused. We can now safely win the "race" by running cleanup logic.
+			h.clock.Step(testShortTTL * 2)
+			item.Finalize(types.ErrTTLExpired) // This will finalize the item with RejectedOther.
+
+			// 5. Un-pause the dispatch goroutine.
+			close(policyCanProceed)
+
+			// --- ASSERT ---
+			// The item's final state should be from the Finalize call above.
+			outcome, err := h.waitForFinalization(item)
+			assert.Equal(t, types.QueueOutcomeEvictedTTL, outcome, "The outcome should be EvictedTTL from the Finalize call")
+			require.Error(t, err, "A TTL eviction should produce an error")
+			assert.ErrorIs(t, err, types.ErrTTLExpired, "The error should be of type ErrTTLExpired")
+		})
+
+		t.Run("should shut down cleanly on context cancellation", func(t *testing.T) {
+			t.Parallel()
+			// --- ARRANGE ---
+			h := newTestHarness(t, testCleanupTick)
+			stopped := make(chan struct{})
+
+			// --- ACT ---
+			h.Start()
+			h.Go()
+
+			// Use a separate goroutine to wait for the processor to fully stop.
+			go func() {
+				h.Stop() // This cancels the context and waits on the WaitGroup.
+				close(stopped)
+			}()
+
+			// --- ASSERT ---
+			select {
+			case <-stopped:
+				// Success: The Stop() call completed without a deadlock.
+			case <-time.After(testWaitTimeout):
+				t.Fatal("Test timed out waiting for processor to stop")
+			}
+		})
+
+		t.Run("should not panic on nil item from enqueue channel", func(t *testing.T) {
+			t.Parallel()
+			// --- ARRANGE ---
+			h := newTestHarness(t, testCleanupTick)
+			// This test is primarily checking that the processor doesn't panic or error on a nil input.
+
+			// --- ACT ---
+			h.Start()
+			defer h.Stop()
+			h.Go()
+			require.NoError(t, h.processor.Submit(nil), "Submit should not fail")
+
+			// --- ASSERT ---
+			// Allow a moment for the processor to potentially process the nil item.
+			// A successful test is one that completes without panicking.
+			time.Sleep(50 * time.Millisecond)
+		})
+
+	})
+
+	t.Run("Unit", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("enqueue", func(t *testing.T) {
+			t.Parallel()
+			testErr := errors.New("something went wrong")
+
+			testCases := []struct {
+				name         string
+				setupHarness func(h *testHarness)
+				item         *FlowItem
+				assert       func(t *testing.T, h *testHarness, item *FlowItem)
+			}{
+				{
+					name: "should reject item on registry queue lookup failure",
+					setupHarness: func(h *testHarness) {
+						h.ManagedQueueFunc = func(flowcontrol.FlowKey) (contracts.ManagedQueue, error) { return nil, testErr }
+					},
+					assert: func(t *testing.T, h *testHarness, item *FlowItem) {
+						assert.Equal(t, types.QueueOutcomeRejectedOther, item.FinalState().Outcome,
+							"Outcome should be RejectedOther")
+						require.Error(t, item.FinalState().Err, "An error should be returned")
+						assert.ErrorIs(t, item.FinalState().Err, testErr, "The underlying error should be preserved")
+					},
+				},
+				{
+					name: "should reject item on registry capacity lookup failure",
+					setupHarness: func(h *testHarness) {
+						h.addQueue(testFlow)
+						h.CapacitySnapshotFunc = func(int) (contracts.CapacitySnapshot, error) {
+							return contracts.CapacitySnapshot{}, testErr
+						}
+					},
+					assert: func(t *testing.T, h *testHarness, item *FlowItem) {
+						assert.Equal(t, types.QueueOutcomeRejectedOther, item.FinalState().Outcome,
+							"Outcome should be RejectedOther")
+						require.Error(t, item.FinalState().Err, "An error should be returned")
+						assert.ErrorIs(t, item.FinalState().Err, testErr, "The underlying error should be preserved")
+					},
+				},
+				{
+					name: "should reject item on queue add failure",
+					setupHarness: func(h *testHarness) {
+						mockQueue := h.addQueue(testFlow)
+						mockQueue.AddFunc = func(flowcontrol.QueueItemAccessor) error { return testErr }
+					},
+					assert: func(t *testing.T, h *testHarness, item *FlowItem) {
+						assert.Equal(t, types.QueueOutcomeRejectedOther, item.FinalState().Outcome,
+							"Outcome should be RejectedOther")
+						require.Error(t, item.FinalState().Err, "An error should be returned")
+						assert.ErrorIs(t, item.FinalState().Err, testErr, "The underlying error should be preserved")
+					},
+				},
+				{
+					name: "should reject item as no-endpoints when at capacity with an empty pool",
+					setupHarness: func(h *testHarness) {
+						h.addQueue(testFlow)
+						// Pool scaled to zero: the queue acts as a scale-from-zero waiting room.
+						h.endpointCandidates.Candidates = nil
+						// Prime the regime via a dispatch cycle, mirroring the Run loop's periodic dispatch.
+						h.processor.dispatchCycle(context.Background())
+						h.CapacitySnapshotFunc = func(int) (contracts.CapacitySnapshot, error) {
+							return contracts.CapacitySnapshot{
+								Band: contracts.CapacityDimension{CapacityBytes: 50}, // 50 is less than item size of 100
+							}, nil
+						}
+					},
+					assert: func(t *testing.T, h *testHarness, item *FlowItem) {
+						assert.Equal(t, types.QueueOutcomeRejectedNoEndpoints, item.FinalState().Outcome,
+							"Outcome should be RejectedNoEndpoints when the pool is empty")
+						require.Error(t, item.FinalState().Err, "A no-endpoints rejection should produce an error")
+						assert.ErrorIs(t, item.FinalState().Err, types.ErrNoEndpoints, "The error should wrap ErrNoEndpoints")
+						assert.ErrorIs(t, item.FinalState().Err, types.ErrRejected, "The error should wrap ErrRejected")
+					},
+				},
+				{
+					name: "should reject item as capacity when at capacity with a non-empty pool",
+					setupHarness: func(h *testHarness) {
+						h.addQueue(testFlow)
+						// Non-empty pool (harness default): a capacity rejection is backpressure, not unavailability.
+						h.processor.dispatchCycle(context.Background())
+						h.CapacitySnapshotFunc = func(int) (contracts.CapacitySnapshot, error) {
+							return contracts.CapacitySnapshot{
+								Band: contracts.CapacityDimension{CapacityBytes: 50}, // 50 is less than item size of 100
+							}, nil
+						}
+					},
+					assert: func(t *testing.T, h *testHarness, item *FlowItem) {
+						assert.Equal(t, types.QueueOutcomeRejectedCapacity, item.FinalState().Outcome,
+							"Outcome should be RejectedCapacity when the pool is non-empty")
+						require.Error(t, item.FinalState().Err, "A capacity rejection should produce an error")
+						assert.ErrorIs(t, item.FinalState().Err, types.ErrQueueAtCapacity,
+							"The error should wrap ErrQueueAtCapacity")
+					},
+				},
+				{
+					name: "should ignore an already-finalized item",
+					setupHarness: func(h *testHarness) {
+						mockQueue := h.addQueue(testFlow)
+						var addCallCount int
+						mockQueue.AddFunc = func(item flowcontrol.QueueItemAccessor) error {
+							addCallCount++
+							return nil
+						}
+						// Use Cleanup to assert after the test logic has run.
+						t.Cleanup(func() {
+							assert.Equal(t, 0, addCallCount, "Queue.Add should not have been called for a finalized item")
+						})
+					},
+					item: func() *FlowItem {
+						// Create a pre-finalized item.
+						item := newTestHarness(t, 0).newTestItem("req-finalized", testFlow, testTTL)
+						item.FinalizeWithOutcome(types.QueueOutcomeDispatched, nil)
+						return item
+					}(),
+					assert: func(t *testing.T, h *testHarness, item *FlowItem) {
+						// The item was already finalized, so its state should not change.
+						assert.Equal(t, types.QueueOutcomeDispatched, item.FinalState().Outcome, "Outcome should remain unchanged")
+						assert.NoError(t, item.FinalState().Err, "Error should remain unchanged")
+					},
+				},
+			}
+
+			for _, tc := range testCases {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Parallel()
+					h := newTestHarness(t, testCleanupTick)
+					tc.setupHarness(h)
+					item := tc.item
+					if item == nil {
+						item = h.newTestItem("req-enqueue-test", testFlow, testTTL)
+					}
+					h.processor.enqueue(item)
+					tc.assert(t, h, item)
+				})
+			}
+		})
+
+		t.Run("hasCapacity", func(t *testing.T) {
+			t.Parallel()
+			testCases := []struct {
+				name         string
+				itemByteSize uint64
+				snapshot     contracts.CapacitySnapshot
+				expectHasCap bool
+			}{
+				{
+					name:         "should deny item if global byte capacity exceeded",
+					itemByteSize: 1,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{ByteSize: 100, CapacityBytes: 100},
+					},
+					expectHasCap: false,
+				},
+				{
+					name:         "should deny item if global request capacity exceeded",
+					itemByteSize: 0,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{CapacityRequests: 10, Len: 10},
+						Band:   contracts.CapacityDimension{CapacityRequests: 100, Len: 0},
+					},
+					expectHasCap: false,
+				},
+				{
+					name:         "should deny item if band byte capacity exceeded",
+					itemByteSize: 1,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{CapacityBytes: 200, ByteSize: 100},
+						Band:   contracts.CapacityDimension{ByteSize: 50, CapacityBytes: 50},
+					},
+					expectHasCap: false,
+				},
+				{
+					name:         "should deny item if band request capacity exceeded",
+					itemByteSize: 0,
+					snapshot: contracts.CapacitySnapshot{
+						Band: contracts.CapacityDimension{CapacityRequests: 5, Len: 5},
+					},
+					expectHasCap: false,
+				},
+				{
+					name:         "should allow item if both global and band have byte capacity",
+					itemByteSize: 10,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{CapacityBytes: 200, ByteSize: 100},
+						Band:   contracts.CapacityDimension{ByteSize: 50, CapacityBytes: 100},
+					},
+					expectHasCap: true,
+				},
+				{
+					name:         "should allow item if both global and band have request capacity",
+					itemByteSize: 0,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{CapacityRequests: 10, Len: 5},
+						Band:   contracts.CapacityDimension{CapacityRequests: 8, Len: 3},
+					},
+					expectHasCap: true,
+				},
+				{
+					name:         "should ignore zero-valued capacity limits",
+					itemByteSize: 0,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{CapacityBytes: 0, ByteSize: 999, CapacityRequests: 0, Len: 999},
+						Band:   contracts.CapacityDimension{CapacityBytes: 0, ByteSize: 999, CapacityRequests: 0, Len: 999},
+					},
+					expectHasCap: true,
+				},
+				// --- Mixed dimension tests ---
+				{
+					name:         "should deny if global bytes ok but band requests exceeded",
+					itemByteSize: 10,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{CapacityBytes: 200, ByteSize: 50, CapacityRequests: 100, Len: 5},
+						Band:   contracts.CapacityDimension{CapacityBytes: 100, ByteSize: 20, CapacityRequests: 5, Len: 5},
+					},
+					expectHasCap: false,
+				},
+				{
+					name:         "should deny if global requests ok but band bytes exceeded",
+					itemByteSize: 10,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{CapacityBytes: 200, ByteSize: 50, CapacityRequests: 100, Len: 5},
+						Band:   contracts.CapacityDimension{CapacityBytes: 20, ByteSize: 20, CapacityRequests: 100, Len: 3},
+					},
+					expectHasCap: false,
+				},
+				{
+					name:         "should allow if all four checks pass",
+					itemByteSize: 10,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{CapacityBytes: 200, ByteSize: 50, CapacityRequests: 100, Len: 10},
+						Band:   contracts.CapacityDimension{CapacityBytes: 100, ByteSize: 20, CapacityRequests: 50, Len: 5},
+					},
+					expectHasCap: true,
+				},
+				// --- Boundary value tests ---
+				{
+					name:         "should allow when global bytes exactly at capacity after add",
+					itemByteSize: 10,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{CapacityBytes: 110, ByteSize: 100},
+						Band:   contracts.CapacityDimension{CapacityBytes: 60, ByteSize: 50},
+					},
+					expectHasCap: true,
+				},
+				{
+					name:         "should deny when global bytes one over capacity after add",
+					itemByteSize: 11,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{CapacityBytes: 110, ByteSize: 100},
+						Band:   contracts.CapacityDimension{CapacityBytes: 200, ByteSize: 50},
+					},
+					expectHasCap: false,
+				},
+				{
+					name:         "should allow when global requests exactly at capacity after add",
+					itemByteSize: 0,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{CapacityRequests: 10, Len: 9},
+						Band:   contracts.CapacityDimension{CapacityRequests: 10, Len: 5},
+					},
+					expectHasCap: true,
+				},
+				{
+					name:         "should deny when global requests one over capacity after add",
+					itemByteSize: 0,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{CapacityRequests: 10, Len: 10},
+						Band:   contracts.CapacityDimension{CapacityRequests: 100, Len: 5},
+					},
+					expectHasCap: false,
+				},
+				{
+					name:         "should allow when band bytes exactly at capacity after add",
+					itemByteSize: 10,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{CapacityBytes: 500, ByteSize: 100},
+						Band:   contracts.CapacityDimension{CapacityBytes: 60, ByteSize: 50},
+					},
+					expectHasCap: true,
+				},
+				{
+					name:         "should deny when band bytes one over capacity after add",
+					itemByteSize: 11,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{CapacityBytes: 500, ByteSize: 100},
+						Band:   contracts.CapacityDimension{CapacityBytes: 60, ByteSize: 50},
+					},
+					expectHasCap: false,
+				},
+				{
+					name:         "should allow when band requests exactly at capacity after add",
+					itemByteSize: 0,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{CapacityRequests: 100, Len: 10},
+						Band:   contracts.CapacityDimension{CapacityRequests: 6, Len: 5},
+					},
+					expectHasCap: true,
+				},
+				{
+					name:         "should deny when band requests one over capacity after add",
+					itemByteSize: 0,
+					snapshot: contracts.CapacitySnapshot{
+						Global: contracts.CapacityDimension{CapacityRequests: 100, Len: 10},
+						Band:   contracts.CapacityDimension{CapacityRequests: 5, Len: 5},
+					},
+					expectHasCap: false,
+				},
+			}
+
+			for _, tc := range testCases {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Parallel()
+					h := newTestHarness(t, testCleanupTick)
+					h.CapacitySnapshotFunc = func(int) (contracts.CapacitySnapshot, error) { return tc.snapshot, nil }
+					hasCap, _, err := h.processor.hasCapacity(testFlow.Priority, tc.itemByteSize)
+					require.NoError(t, err, "hasCapacity should not fail when the snapshot read succeeds")
+					assert.Equal(t, tc.expectHasCap, hasCap, "Capacity check result should match expected value")
+				})
+			}
+
+			t.Run("should propagate the error when the priority band is not configured", func(t *testing.T) {
+				t.Parallel()
+				h := newTestHarness(t, testCleanupTick)
+				h.CapacitySnapshotFunc = func(int) (contracts.CapacitySnapshot, error) {
+					return contracts.CapacitySnapshot{}, contracts.ErrPriorityBandNotFound
+				}
+				hasCap, _, err := h.processor.hasCapacity(testFlow.Priority, 1)
+				require.ErrorIs(t, err, contracts.ErrPriorityBandNotFound, "The lookup error should be propagated")
+				assert.False(t, hasCap, "A failed capacity read should never report available capacity")
+			})
+		})
+
+		t.Run("dispatchCycle", func(t *testing.T) {
+			t.Parallel()
+
+			t.Run("should handle various policy and registry scenarios", func(t *testing.T) {
+				t.Parallel()
+				policyErr := errors.New("policy failure")
+				registryErr := errors.New("registry error")
+
+				testCases := []struct {
+					name              string
+					setupHarness      func(h *testHarness)
+					expectDidDispatch bool
+				}{
+					{
+						name: "should do nothing if no items are queued",
+						setupHarness: func(h *testHarness) {
+							h.addQueue(testFlow) // Add a queue, but no items.
+						},
+						expectDidDispatch: false,
+					},
+					{
+						name: "should block dispatch on HoL saturation",
+						setupHarness: func(h *testHarness) {
+							// Add a high-priority item that will be selected but is saturated.
+							qHigh := h.addQueue(testFlow) // priority 10
+							require.NoError(t, qHigh.Add(h.newTestItem("item-high", testFlow, testTTL)))
+
+							// Add a low-priority, viable item.
+							keyLow := flowcontrol.FlowKey{ID: "flow-low", Priority: 5}
+							qLow := h.addQueue(keyLow)
+							require.NoError(t, qLow.Add(h.newTestItem("item-low", keyLow, testTTL)))
+
+							h.saturationDetector.SaturationFunc = func(_ context.Context, _ []fwkdl.Endpoint) float64 {
+								return 1.0 // Saturated
+							}
+						},
+						expectDidDispatch: false,
+					},
+					{
+						name: "should skip band on priority band accessor error",
+						setupHarness: func(h *testHarness) {
+							h.PriorityBandAccessorFunc = func(int) (flowcontrol.PriorityBandAccessor, error) {
+								return nil, registryErr
+							}
+						},
+						expectDidDispatch: false,
+					},
+					{
+						name: "should skip band on FairnessPolicy error",
+						setupHarness: func(h *testHarness) {
+							h.addQueue(testFlow)
+							h.fairnessPolicyPick = func(
+								context.Context,
+								flowcontrol.PriorityBandAccessor,
+							) (flowcontrol.FlowQueueAccessor, error) {
+								return nil, policyErr
+							}
+						},
+						expectDidDispatch: false,
+					},
+					{
+						name: "should skip band if FairnessPolicy policy returns no queue",
+						setupHarness: func(h *testHarness) {
+							q := h.addQueue(testFlow)
+							require.NoError(t, q.Add(h.newTestItem("item", testFlow, testTTL)))
+							h.fairnessPolicyPick = func(
+								context.Context,
+								flowcontrol.PriorityBandAccessor,
+							) (flowcontrol.FlowQueueAccessor, error) {
+								// Simulate band being empty or policy choosing to pause.
+								return nil, errors.New("sentinel no item selected")
+							}
+						},
+						expectDidDispatch: false,
+					},
+					{
+						name: "should skip band if selected queue is empty",
+						setupHarness: func(h *testHarness) {
+							q := h.addQueue(testFlow) // Empty queue
+							h.fairnessPolicyPick = func(
+								context.Context,
+								flowcontrol.PriorityBandAccessor,
+							) (flowcontrol.FlowQueueAccessor, error) {
+								return q.FlowQueueAccessor(), nil
+							}
+						},
+						expectDidDispatch: false,
+					},
+					{
+						name: "should continue to lower priority band on FairnessPolicy policy error",
+						setupHarness: func(h *testHarness) {
+							// Create a failing high-priority queue and a working low-priority queue.
+							keyHigh := flowcontrol.FlowKey{ID: "flow-high", Priority: testFlow.Priority}
+							keyLow := flowcontrol.FlowKey{ID: "flow-low", Priority: 20}
+							h.addQueue(keyHigh)
+							qLow := h.addQueue(keyLow)
+
+							itemLow := h.newTestItem("item-low", keyLow, testTTL)
+							require.NoError(t, qLow.Add(itemLow))
+
+							h.fairnessPolicyPick = func(
+								_ context.Context,
+								flowGroup flowcontrol.PriorityBandAccessor,
+							) (flowcontrol.FlowQueueAccessor, error) {
+								if flowGroup.Priority() == testFlow.Priority {
+									return nil, errors.New("policy failure") // Fail high-priority.
+								}
+								// Succeed for low-priority.
+								q, _ := h.managedQueue(keyLow)
+								return q.FlowQueueAccessor(), nil
+							}
+						},
+						expectDidDispatch: true,
+					},
+				}
+
+				for _, tc := range testCases {
+					t.Run(tc.name, func(t *testing.T) {
+						t.Parallel()
+						h := newTestHarness(t, testCleanupTick)
+						tc.setupHarness(h)
+						dispatched := h.processor.dispatchCycle(context.Background())
+						assert.Equal(t, tc.expectDidDispatch, dispatched, "Dispatch result should match expected value")
+					})
+				}
+			})
+
+			t.Run("should guarantee strict priority by starving lower priority items", func(t *testing.T) {
+				t.Parallel()
+				// --- ARRANGE ---
+				h := newTestHarness(t, testCleanupTick)
+				keyHigh := flowcontrol.FlowKey{ID: "flow-high", Priority: 20}
+				keyLow := flowcontrol.FlowKey{ID: "flow-low", Priority: 10}
+				qHigh := h.addQueue(keyHigh)
+				qLow := h.addQueue(keyLow)
+
+				const numItems = 3
+				highPrioItems := make([]*FlowItem, numItems)
+				lowPrioItems := make([]*FlowItem, numItems)
+				for i := range numItems {
+					// Add high priority items.
+					itemH := h.newTestItem(fmt.Sprintf("req-high-%d", i), keyHigh, testTTL)
+					require.NoError(t, qHigh.Add(itemH))
+					highPrioItems[i] = itemH
+
+					// Add low priority items.
+					itemL := h.newTestItem(fmt.Sprintf("req-low-%d", i), keyLow, testTTL)
+					require.NoError(t, qLow.Add(itemL))
+					lowPrioItems[i] = itemL
+				}
+
+				// --- ACT & ASSERT ---
+				// First, dispatch all high-priority items.
+				for i := range numItems {
+					dispatched := h.processor.dispatchCycle(context.Background())
+					require.True(t, dispatched, "Expected a high-priority dispatch on cycle %d", i+1)
+				}
+
+				// Verify all high-priority items are gone and low-priority items remain.
+				for _, item := range highPrioItems {
+					assert.Equal(t, types.QueueOutcomeDispatched, item.FinalState().Outcome,
+						"High-priority item should be dispatched")
+					assert.NoError(t, item.FinalState().Err, "Dispatched high-priority item should not have an error")
+				}
+				assert.Equal(t, numItems, qLow.Len(), "Low-priority queue should still be full")
+
+				// Next, dispatch all low-priority items.
+				for i := range numItems {
+					dispatched := h.processor.dispatchCycle(context.Background())
+					require.True(t, dispatched, "Expected a low-priority dispatch on cycle %d", i+1)
+				}
+				assert.Equal(t, 0, qLow.Len(), "Low-priority queue should be empty")
+			})
+		})
+
+		t.Run("partitionEndpoints", func(t *testing.T) {
+			t.Parallel()
+
+			makeEndpoint := func(labels map[string]string) fwkdl.Endpoint {
+				return fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{Labels: labels}, nil)
+			}
+
+			t.Run("should classify endpoints by role label", func(t *testing.T) {
+				t.Parallel()
+				endpoints := []fwkdl.Endpoint{
+					makeEndpoint(map[string]string{bylabel.RoleLabel: bylabel.RolePrefill}),
+					makeEndpoint(map[string]string{bylabel.RoleLabel: bylabel.RoleEncodePrefill}),
+					makeEndpoint(map[string]string{bylabel.RoleLabel: bylabel.RoleDecode}),
+					makeEndpoint(map[string]string{bylabel.RoleLabel: bylabel.RolePrefillDecode}),
+					makeEndpoint(map[string]string{bylabel.RoleLabel: bylabel.RoleEncodePrefillDecode}),
+				}
+
+				prefill, decode, interleaved := partitionEndpoints(endpoints)
+				assert.Len(t, prefill, 2, "prefill should contain RolePrefill and RoleEncodePrefill")
+				assert.Len(t, decode, 1, "decode should contain RoleDecode")
+				assert.Len(t, interleaved, 2, "interleaved should contain RolePrefillDecode and RoleEncodePrefillDecode")
+			})
+
+			t.Run("should default unlabeled endpoints to decode", func(t *testing.T) {
+				t.Parallel()
+				endpoints := []fwkdl.Endpoint{
+					makeEndpoint(nil),                                 // no labels map
+					makeEndpoint(map[string]string{}),                 // empty labels
+					makeEndpoint(map[string]string{"other": "value"}), // unrelated label
+					fwkdl.NewEndpoint(nil, nil),                       // nil metadata gets defaulted by NewEndpoint
+				}
+
+				prefill, decode, interleaved := partitionEndpoints(endpoints)
+				assert.Empty(t, prefill)
+				assert.Len(t, decode, 4, "all unlabeled endpoints should land in decode")
+				assert.Empty(t, interleaved)
+			})
+
+			t.Run("should exclude unrecognized role from all buckets", func(t *testing.T) {
+				t.Parallel()
+				endpoints := []fwkdl.Endpoint{
+					makeEndpoint(map[string]string{bylabel.RoleLabel: "unknown-role"}),
+				}
+
+				prefill, decode, interleaved := partitionEndpoints(endpoints)
+				assert.Empty(t, prefill)
+				assert.Empty(t, decode)
+				assert.Empty(t, interleaved)
+			})
+
+			t.Run("should exclude encode-only endpoints from all buckets", func(t *testing.T) {
+				t.Parallel()
+				endpoints := []fwkdl.Endpoint{
+					makeEndpoint(map[string]string{bylabel.RoleLabel: bylabel.RoleEncode}),
+				}
+
+				prefill, decode, interleaved := partitionEndpoints(endpoints)
+				assert.Empty(t, prefill)
+				assert.Empty(t, decode)
+				assert.Empty(t, interleaved)
+			})
+
+			t.Run("should skip nil endpoints", func(t *testing.T) {
+				t.Parallel()
+				endpoints := []fwkdl.Endpoint{
+					nil,
+					makeEndpoint(map[string]string{bylabel.RoleLabel: bylabel.RolePrefill}),
+				}
+
+				prefill, decode, interleaved := partitionEndpoints(endpoints)
+				assert.Len(t, prefill, 1)
+				assert.Empty(t, decode)
+				assert.Empty(t, interleaved)
+			})
+
+			t.Run("should return empty slices for empty input", func(t *testing.T) {
+				t.Parallel()
+				prefill, decode, interleaved := partitionEndpoints(nil)
+				assert.Empty(t, prefill)
+				assert.Empty(t, decode)
+				assert.Empty(t, interleaved)
+			})
+		})
+
+		t.Run("stage-aware saturation gating", func(t *testing.T) {
+			t.Parallel()
+
+			makeEndpoint := func(role string) fwkdl.Endpoint {
+				return fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{
+					Labels: map[string]string{bylabel.RoleLabel: role},
+				}, nil)
+			}
+
+			t.Run("should gate on highest stage saturation", func(t *testing.T) {
+				t.Parallel()
+				h := newTestHarness(t, testCleanupTick)
+
+				q := h.addQueue(testFlow)
+				require.NoError(t, q.Add(h.newTestItem("item-1", testFlow, testTTL)))
+
+				h.endpointCandidates.Candidates = []fwkdl.Endpoint{
+					makeEndpoint(bylabel.RolePrefill),
+					makeEndpoint(bylabel.RoleDecode),
+				}
+
+				h.saturationDetector.SaturationFunc = func(_ context.Context, endpoints []fwkdl.Endpoint) float64 {
+					for _, ep := range endpoints {
+						if ep.GetMetadata().Labels[bylabel.RoleLabel] != bylabel.RolePrefill {
+							// Any mixed or decode set reads healthy: the flat average is
+							// diluted by idle decode workers.
+							return 0.3
+						}
+					}
+					return 1.5 // homogeneous prefill subset: stage saturated
+				}
+
+				dispatched := h.processor.dispatchCycle(context.Background())
+				assert.False(t, dispatched, "should block when any stage is saturated")
+			})
+
+			t.Run("should not gate when all stages are healthy", func(t *testing.T) {
+				t.Parallel()
+				h := newTestHarness(t, testCleanupTick)
+
+				q := h.addQueue(testFlow)
+				require.NoError(t, q.Add(h.newTestItem("item-1", testFlow, testTTL)))
+
+				h.endpointCandidates.Candidates = []fwkdl.Endpoint{
+					makeEndpoint(bylabel.RolePrefill),
+					makeEndpoint(bylabel.RoleDecode),
+				}
+
+				h.saturationDetector.SaturationFunc = func(_ context.Context, _ []fwkdl.Endpoint) float64 {
+					return 0.3
+				}
+
+				dispatched := h.processor.dispatchCycle(context.Background())
+				assert.True(t, dispatched, "should dispatch when all stages are healthy")
+			})
+
+			t.Run("should skip empty partitions", func(t *testing.T) {
+				t.Parallel()
+				h := newTestHarness(t, testCleanupTick)
+
+				q := h.addQueue(testFlow)
+				require.NoError(t, q.Add(h.newTestItem("item-1", testFlow, testTTL)))
+
+				// Only decode endpoints, no prefill. Empty prefill partition should
+				// be skipped, not treated as saturated (detector returns 1.0 for empty slices).
+				h.endpointCandidates.Candidates = []fwkdl.Endpoint{
+					makeEndpoint(bylabel.RoleDecode),
+				}
+
+				h.saturationDetector.SaturationFunc = func(_ context.Context, endpoints []fwkdl.Endpoint) float64 {
+					if len(endpoints) == 0 {
+						return 1.0 // Would block if not skipped.
+					}
+					return 0.2
+				}
+
+				dispatched := h.processor.dispatchCycle(context.Background())
+				assert.True(t, dispatched, "should dispatch when only non-empty partitions are healthy")
+			})
+
+			t.Run("should include interleaved endpoints in both stage pools", func(t *testing.T) {
+				t.Parallel()
+				h := newTestHarness(t, testCleanupTick)
+
+				q := h.addQueue(testFlow)
+				require.NoError(t, q.Add(h.newTestItem("item-1", testFlow, testTTL)))
+
+				h.endpointCandidates.Candidates = []fwkdl.Endpoint{
+					makeEndpoint(bylabel.RolePrefill),
+					makeEndpoint(bylabel.RoleDecode),
+					makeEndpoint(bylabel.RolePrefillDecode), // interleaved
+				}
+
+				// Track which endpoints each Saturation call receives.
+				var calls [][]string
+				h.saturationDetector.SaturationFunc = func(_ context.Context, endpoints []fwkdl.Endpoint) float64 {
+					roles := make([]string, 0, len(endpoints))
+					for _, ep := range endpoints {
+						roles = append(roles, ep.GetMetadata().Labels[bylabel.RoleLabel])
+					}
+					calls = append(calls, roles)
+					return 0.2
+				}
+
+				h.processor.dispatchCycle(context.Background())
+
+				require.Len(t, calls, 2, "detector should be called once per stage")
+				// Prefill pool: prefill + interleaved
+				assert.ElementsMatch(t, []string{bylabel.RolePrefill, bylabel.RolePrefillDecode}, calls[0])
+				// Decode pool: decode + interleaved
+				assert.ElementsMatch(t, []string{bylabel.RoleDecode, bylabel.RolePrefillDecode}, calls[1])
+			})
+
+			t.Run("should behave like monolithic when no role labels exist", func(t *testing.T) {
+				t.Parallel()
+				h := newTestHarness(t, testCleanupTick)
+
+				q := h.addQueue(testFlow)
+				require.NoError(t, q.Add(h.newTestItem("item-1", testFlow, testTTL)))
+
+				// Unlabeled endpoints all land in decode, behaving like the pre-change single-pool path.
+				h.endpointCandidates.Candidates = []fwkdl.Endpoint{
+					fwkdl.NewEndpoint(nil, nil),
+					fwkdl.NewEndpoint(nil, nil),
+				}
+
+				h.saturationDetector.SaturationFunc = func(_ context.Context, _ []fwkdl.Endpoint) float64 {
+					return 0.4
+				}
+
+				dispatched := h.processor.dispatchCycle(context.Background())
+				assert.True(t, dispatched, "monolithic deployment should dispatch normally")
+			})
+		})
+
+		t.Run("dispatchItem", func(t *testing.T) {
+			t.Parallel()
+
+			t.Run("should fail on registry errors", func(t *testing.T) {
+				t.Parallel()
+				registryErr := errors.New("registry error")
+
+				testCases := []struct {
+					name        string
+					setupMocks  func(h *testHarness)
+					expectedErr error
+				}{
+					{
+						name: "on ManagedQueue lookup failure",
+						setupMocks: func(h *testHarness) {
+							h.ManagedQueueFunc = func(flowcontrol.FlowKey) (contracts.ManagedQueue, error) { return nil, registryErr }
+						},
+						expectedErr: registryErr,
+					},
+				}
+
+				for _, tc := range testCases {
+					t.Run(tc.name, func(t *testing.T) {
+						t.Parallel()
+						h := newTestHarness(t, testCleanupTick)
+						tc.setupMocks(h)
+						item := h.newTestItem("req-dispatch-fail", testFlow, testTTL)
+						err := h.processor.dispatchItem(item)
+						require.Error(t, err, "dispatchItem should return an error")
+						assert.ErrorIs(t, err, tc.expectedErr, "The underlying registry error should be preserved")
+					})
+				}
+			})
+
+			t.Run("should not dispatch already finalized item", func(t *testing.T) {
+				t.Parallel()
+				// --- ARRANGE ---
+				h := newTestHarness(t, testCleanupTick)
+				item := h.newTestItem("req-already-finalized", testFlow, testTTL)
+				item.FinalizeWithOutcome(types.QueueOutcomeRejectedOther, errors.New("already done"))
+
+				h.ManagedQueueFunc = func(flowcontrol.FlowKey) (contracts.ManagedQueue, error) {
+					return &mocks.MockManagedQueue{
+						RemoveFunc: func(flowcontrol.QueueItemHandle) (flowcontrol.QueueItemAccessor, error) {
+							return item, nil
+						},
+					}, nil
+				}
+
+				// --- ACT ---
+				err := h.processor.dispatchItem(item)
+
+				// --- ASSERT ---
+				require.NoError(t, err, "dispatchItem should return no error for an already finalized item")
+
+				// Check the final state of the item itself - it should not have changed.
+				finalState := item.FinalState()
+				require.NotNil(t, finalState, "Item must be finalized")
+				assert.Equal(t, types.QueueOutcomeRejectedOther, finalState.Outcome,
+					"The item's final outcome should be RejectedOther")
+				assert.ErrorContains(t, finalState.Err, "already done",
+					"The error should be the one from the first Finalize call")
+			})
+		})
+
+		t.Run("cleanup and utility methods", func(t *testing.T) {
+			t.Parallel()
+
+			t.Run("should sweep externally finalized items", func(t *testing.T) {
+				t.Parallel()
+				// --- ARRANGE ---
+				h := newTestHarness(t, testCleanupTick)
+				item := h.newTestItem("req-external-finalized", testFlow, testTTL)
+				q := h.addQueue(testFlow)
+				require.NoError(t, q.Add(item), "Failed to add item to queue")
+
+				// Externally finalize the item
+				item.Finalize(context.Canceled)
+				require.NotNil(t, item.FinalState(), "Item should be finalized")
+
+				// --- ACT ---
+				h.processor.sweepFinalizedItems()
+
+				// --- ASSERT ---
+				assert.Equal(t, 0, q.Len(), "Queue should be empty after sweep")
+				finalState := item.FinalState()
+				assert.Equal(t, types.QueueOutcomeEvictedContextCancelled, finalState.Outcome,
+					"Outcome should be EvictedContextCancelled")
+				assert.ErrorIs(t, finalState.Err, types.ErrContextCancelled, "Error should be ErrContextCancelled")
+
+				// Verify the sweep path recorded the drop.
+				assert.Equal(t, uint64(1), h.processor.dropCounts[types.QueueOutcomeEvictedContextCancelled].Load(),
+					"Drop should be recorded for EvictedContextCancelled")
+			})
+
+			t.Run("should not sweep items not finalized", func(t *testing.T) {
+				t.Parallel()
+				// --- ARRANGE ---
+				h := newTestHarness(t, testCleanupTick)
+				item := h.newTestItem("req-not-finalized", testFlow, testTTL)
+				q := h.addQueue(testFlow)
+				require.NoError(t, q.Add(item), "Failed to add item to queue")
+
+				// --- ACT ---
+				h.processor.sweepFinalizedItems()
+
+				// --- ASSERT ---
+				assert.Equal(t, 1, q.Len(), "Queue should still contain the item")
+				assert.Nil(t, item.FinalState(), "Item should not be finalized")
+			})
+
+			t.Run("should evict all items on shutdown", func(t *testing.T) {
+				t.Parallel()
+				// --- ARRANGE ---
+				h := newTestHarness(t, testCleanupTick)
+				item := h.newTestItem("req-pending", testFlow, testTTL)
+				q := h.addQueue(testFlow)
+				require.NoError(t, q.Add(item))
+
+				// --- ACT ---
+				h.processor.evictAll()
+
+				// --- ASSERT ---
+				assert.Equal(t, types.QueueOutcomeEvictedOther, item.FinalState().Outcome,
+					"Item outcome should be EvictedOther")
+				require.Error(t, item.FinalState().Err, "Item should have an error")
+				assert.ErrorIs(t, item.FinalState().Err, types.ErrFlowControllerNotRunning,
+					"Item error should be ErrFlowControllerNotRunning")
+			})
+
+			t.Run("should handle registry errors gracefully during concurrent processing", func(t *testing.T) {
+				t.Parallel()
+				// --- ARRANGE ---
+				h := newTestHarness(t, testCleanupTick)
+				h.AllOrderedPriorityLevelsFunc = func() []int { return []int{testFlow.Priority} }
+				h.PriorityBandAccessorFunc = func(p int) (flowcontrol.PriorityBandAccessor, error) {
+					return nil, errors.New("registry error")
+				}
+
+				// --- ACT & ASSERT ---
+				// The test passes if this call completes without panicking.
+				assert.NotPanics(t, func() {
+					h.processor.processAllQueuesConcurrently("test", func(mq contracts.ManagedQueue, logger logr.Logger) {})
+				}, "processAllQueuesConcurrently should not panic on registry errors")
+			})
+
+			t.Run("should process all queues with a worker pool", func(t *testing.T) {
+				t.Parallel()
+				// --- ARRANGE ---
+				h := newTestHarness(t, testCleanupTick)
+
+				// Create more queues than the fixed number of cleanup workers to ensure the pooling logic is exercised.
+				const numQueues = maxCleanupWorkers + 5
+				var processedCount atomic.Int32
+
+				for i := range numQueues {
+					key := flowcontrol.FlowKey{
+						ID:       fmt.Sprintf("flow-%d", i),
+						Priority: testFlow.Priority,
+					}
+					h.addQueue(key)
+				}
+
+				processFn := func(mq contracts.ManagedQueue, logger logr.Logger) {
+					processedCount.Add(1)
+				}
+
+				// --- ACT ---
+				h.processor.processAllQueuesConcurrently("test-worker-pool", processFn)
+
+				// --- ASSERT ---
+				assert.Equal(t, int32(numQueues), processedCount.Load(),
+					"The number of processed queues should match the number created")
+			})
+
+			t.Run("should resolve ManagedQueue eagerly so late GC does not skip work", func(t *testing.T) {
+				t.Parallel()
+				// --- ARRANGE ---
+				// Regression test: ManagedQueue must be resolved during IterateQueues
+				// (Phase 1), not deferred to Phase 3 workers. A deferred lookup
+				// races with flow GC which can delete the flow after collection.
+				//
+				// ManagedQueueFunc succeeds while IterateQueues is running and fails
+				// after it returns, simulating GC firing between phases. With eager
+				// resolution processFn is called; with deferred resolution it is not.
+				h := newTestHarness(t, testCleanupTick)
+				h.addQueue(testFlow)
+
+				var iteratingDone atomic.Bool
+				h.PriorityBandAccessorFunc = func(p int) (flowcontrol.PriorityBandAccessor, error) {
+					h.mu.Lock()
+					flowKeys := h.priorityFlows[p]
+					h.mu.Unlock()
+
+					band := &fwkfcmocks.MockPriorityBandAccessor{PriorityV: p}
+					band.IterateQueuesFunc = func(cb func(fqa flowcontrol.FlowQueueAccessor) bool) {
+						for _, key := range flowKeys {
+							q, err := h.managedQueue(key)
+							if err == nil && q != nil {
+								mq := q.(*mocks.MockManagedQueue)
+								if !cb(mq.FlowQueueAccessor()) {
+									break
+								}
+							}
+						}
+						iteratingDone.Store(true)
+					}
+					return band, nil
+				}
+
+				h.ManagedQueueFunc = func(key flowcontrol.FlowKey) (contracts.ManagedQueue, error) {
+					if iteratingDone.Load() {
+						return nil, fmt.Errorf("failed to get managed queue for flow %q: %w",
+							key, contracts.ErrFlowInstanceNotFound)
+					}
+					return h.managedQueue(key)
+				}
+
+				var processedCount atomic.Int32
+				processFn := func(mq contracts.ManagedQueue, logger logr.Logger) {
+					processedCount.Add(1)
+				}
+
+				// --- ACT ---
+				h.processor.processAllQueuesConcurrently("test-eager-resolve", processFn)
+
+				// --- ASSERT ---
+				assert.Equal(t, int32(1), processedCount.Load(),
+					"processFn must be called: ManagedQueue was resolved eagerly in Phase 1")
+			})
+		})
+	})
+
+	t.Run("Public API", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("Submit", func(t *testing.T) {
+			t.Parallel()
+
+			t.Run("should return ErrProcessorBusy when channel is full", func(t *testing.T) {
+				t.Parallel()
+				h := newTestHarness(t, testCleanupTick)
+				h.processor.enqueueChan = make(chan *FlowItem, 1)
+				h.processor.enqueueChan <- h.newTestItem("item-filler", testFlow, testTTL) // Fill the channel to capacity.
+
+				// The next submit should be non-blocking and fail immediately.
+				err := h.processor.Submit(h.newTestItem("item-to-reject", testFlow, testTTL))
+				require.Error(t, err, "Submit must return an error when the channel is full")
+				assert.ErrorIs(t, err, ErrProcessorBusy, "The returned error must be ErrProcessorBusy")
+			})
+
+			t.Run("should return ErrFlowControllerNotRunning if lifecycleCtx is cancelled", func(t *testing.T) {
+				t.Parallel()
+				h := newTestHarness(t, testCleanupTick)
+				h.Start()
+				h.Go()     // Ensure the Run loop has started
+				h.cancel() // Cancel the lifecycle context
+				h.Stop()   // Wait for the processor to fully stop
+
+				item := h.newTestItem("item-ctx-cancel", testFlow, testTTL)
+				err := h.processor.Submit(item)
+				require.ErrorIs(t, err, types.ErrFlowControllerNotRunning,
+					"Submit must return ErrFlowControllerNotRunning when lifecycleCtx is cancelled")
+				assert.Nil(t, item.FinalState(), "Item should not be finalized by Submit")
+
+				err = h.processor.SubmitOrBlock(context.Background(), item)
+				require.ErrorIs(t, err, types.ErrFlowControllerNotRunning,
+					"SubmitOrBlock must return ErrFlowControllerNotRunning when lifecycleCtx is cancelled")
+				assert.Nil(t, item.FinalState(), "Item should not be finalized by SubmitOrBlock")
+			})
+		})
+
+		t.Run("SubmitOrBlock", func(t *testing.T) {
+			t.Parallel()
+
+			t.Run("should block when channel is full and succeed when space becomes available", func(t *testing.T) {
+				t.Parallel()
+				h := newTestHarness(t, testCleanupTick)
+				h.processor.enqueueChan = make(chan *FlowItem, 1)
+				h.processor.enqueueChan <- h.newTestItem("item-filler", testFlow, testTTL) // Fill the channel to capacity.
+
+				itemToSubmit := h.newTestItem("item-to-block", testFlow, testTTL)
+				submitErr := make(chan error, 1)
+
+				// Run `SubmitOrBlock` in a separate goroutine, as it will block.
+				go func() {
+					submitErr <- h.processor.SubmitOrBlock(context.Background(), itemToSubmit)
+				}()
+
+				// Prove that the call is blocking by ensuring it hasn't returned an error yet.
+				time.Sleep(20 * time.Millisecond)
+				require.Len(t, submitErr, 0, "SubmitOrBlock should be blocking and not have returned yet")
+				<-h.processor.enqueueChan // Make space in the channel. This should unblock the goroutine.
+
+				select {
+				case err := <-submitErr:
+					require.NoError(t, err, "SubmitOrBlock should succeed and return no error after being unblocked")
+				case <-time.After(testWaitTimeout):
+					t.Fatal("SubmitOrBlock did not return after space was made in the channel")
+				}
+			})
+
+			t.Run("should unblock and return context error on cancellation", func(t *testing.T) {
+				t.Parallel()
+				h := newTestHarness(t, testCleanupTick)
+				h.processor.enqueueChan = make(chan *FlowItem) // Use an unbuffered channel to guarantee the first send blocks.
+				itemToSubmit := h.newTestItem("item-to-cancel", testFlow, testTTL)
+				submitErr := make(chan error, 1)
+				ctx, cancel := context.WithCancel(context.Background())
+
+				// Run `SubmitOrBlock` in a separate goroutine, as it will block.
+				go func() {
+					submitErr <- h.processor.SubmitOrBlock(ctx, itemToSubmit)
+				}()
+
+				// Prove that the call is blocking.
+				time.Sleep(20 * time.Millisecond)
+				require.Len(t, submitErr, 0, "SubmitOrBlock should be blocking and not have returned yet")
+				cancel() // Cancel the context. This should unblock the goroutine.
+
+				select {
+				case err := <-submitErr:
+					require.Error(t, err, "SubmitOrBlock should return an error after context cancellation")
+					assert.ErrorIs(t, err, context.Canceled, "The returned error must be context.Canceled")
+				case <-time.After(testWaitTimeout):
+					t.Fatal("SubmitOrBlock did not return after context was cancelled")
+				}
+			})
+
+			t.Run("should reject immediately if shutting down", func(t *testing.T) {
+				t.Parallel()
+				h := newTestHarness(t, testCleanupTick)
+				item := h.newTestItem("req-shutdown-reject", testFlow, testTTL)
+				h.addQueue(testFlow)
+
+				h.Start()
+				h.Go()
+				h.Stop() // Stop the processor, then immediately try to enqueue.
+				err := h.processor.SubmitOrBlock(context.Background(), item)
+
+				require.Error(t, err, "SubmitOrBlock should return an error when shutting down")
+				assert.ErrorIs(t, err, types.ErrFlowControllerNotRunning, "The error should be ErrFlowControllerNotRunning")
+
+				// Item should not be finalized by the processor
+				assert.Nil(t, item.FinalState(), "Item should not be finalized by the processor")
+			})
+		})
+	})
+}
+
+// TestProcessor_DropSummary verifies the periodic drop-count accounting introduced in #2101.
+func TestProcessor_DropSummary(t *testing.T) {
+	t.Parallel()
+
+	// Verify that the dropCounts array is large enough to hold every QueueOutcome value.
+	// If new outcomes are added in the future, this check will catch them at compile time.
+	var _ = [types.NumQueueOutcomes]struct{}{}
+
+	t.Run("capacity rejection increments counter", func(t *testing.T) {
+		t.Parallel()
+		h := newTestHarness(t, testCleanupTick)
+		h.addQueue(testFlow)
+
+		// Force capacity-full: band has 1 slot already used, CapacityRequests=1.
+		h.CapacitySnapshotFunc = func(int) (contracts.CapacitySnapshot, error) {
+			return contracts.CapacitySnapshot{
+				Global: contracts.CapacityDimension{CapacityBytes: 1e9},
+				Band:   contracts.CapacityDimension{CapacityRequests: 1, Len: 1},
+			}, nil
+		}
+
+		item := h.newTestItem("req-cap", testFlow, testTTL)
+		h.processor.enqueue(item)
+
+		outcome, _ := h.waitForFinalization(item)
+		require.Equal(t, types.QueueOutcomeRejectedCapacity, outcome)
+
+		count := h.processor.dropCounts[types.QueueOutcomeRejectedCapacity].Load()
+		assert.Equal(t, uint64(1), count, "RejectedCapacity counter should be 1 after one capacity rejection")
+	})
+
+	t.Run("counters reset after flush", func(t *testing.T) {
+		t.Parallel()
+		h := newTestHarness(t, testCleanupTick)
+		h.addQueue(testFlow)
+
+		// Force capacity-full.
+		h.CapacitySnapshotFunc = func(int) (contracts.CapacitySnapshot, error) {
+			return contracts.CapacitySnapshot{
+				Global: contracts.CapacityDimension{CapacityBytes: 1e9},
+				Band:   contracts.CapacityDimension{CapacityRequests: 1, Len: 1},
+			}, nil
+		}
+
+		item := h.newTestItem("req-flush", testFlow, testTTL)
+		h.processor.enqueue(item)
+		h.waitForFinalization(item) //nolint:errcheck
+
+		require.Equal(t, uint64(1), h.processor.dropCounts[types.QueueOutcomeRejectedCapacity].Load())
+
+		// Flushing should zero out all counters.
+		h.processor.flushDropSummary()
+		assert.Equal(t, uint64(0), h.processor.dropCounts[types.QueueOutcomeRejectedCapacity].Load(),
+			"Counter should be 0 after flush")
+	})
+
+	t.Run("multiple outcome types are counted independently", func(t *testing.T) {
+		t.Parallel()
+		h := newTestHarness(t, testCleanupTick)
+		h.addQueue(testFlow)
+
+		// Reject via capacity: band has 1 slot already used, CapacityRequests=1.
+		h.CapacitySnapshotFunc = func(int) (contracts.CapacitySnapshot, error) {
+			return contracts.CapacitySnapshot{
+				Global: contracts.CapacityDimension{CapacityBytes: 1e9},
+				Band:   contracts.CapacityDimension{CapacityRequests: 1, Len: 1},
+			}, nil
+		}
+		for i := range 2 {
+			item := h.newTestItem(fmt.Sprintf("req-multi-cap-%d", i), testFlow, testTTL)
+			h.processor.enqueue(item)
+			h.waitForFinalization(item) //nolint:errcheck
+		}
+
+		// Reject via configuration error (RejectedOther): fail the capacity lookup.
+		h.CapacitySnapshotFunc = func(int) (contracts.CapacitySnapshot, error) {
+			return contracts.CapacitySnapshot{}, errors.New("forced capacity lookup failure")
+		}
+		item := h.newTestItem("req-multi-other", testFlow, testTTL)
+		h.processor.enqueue(item)
+		h.waitForFinalization(item) //nolint:errcheck
+
+		assert.Equal(t, uint64(2), h.processor.dropCounts[types.QueueOutcomeRejectedCapacity].Load(),
+			"RejectedCapacity counter should be 2")
+		assert.Equal(t, uint64(1), h.processor.dropCounts[types.QueueOutcomeRejectedOther].Load(),
+			"RejectedOther counter should be 1")
+	})
+
+	t.Run("shutdown eviction counts unfinalized queued items exactly once", func(t *testing.T) {
+		t.Parallel()
+		h := newTestHarness(t, testCleanupTick)
+		mockQueue := h.addQueue(testFlow)
+
+		item := h.newTestItem("req-evict-shutdown", testFlow, testTTL)
+		require.NoError(t, mockQueue.Add(item))
+		require.Nil(t, item.FinalState(), "item must not be finalized before evictAll")
+
+		// evictAll runs on shutdown to drain all queues.
+		h.processor.evictAll()
+
+		h.waitForFinalization(item) //nolint:errcheck
+
+		assert.Equal(t, uint64(1), h.processor.dropCounts[types.QueueOutcomeEvictedOther].Load(),
+			"evictAll should count the unfinalized queued item exactly once")
+	})
+}
+
+// TestProcessor_QueueWaitBudget verifies that the queue-wait budget tracks the unavailability regime: the saturation
+// budget while the pool has endpoints, the no-endpoint budget while it does not, re-evaluated as the request waits
+// rather than fixed at admission.
+func TestProcessor_QueueWaitBudget(t *testing.T) {
+	t.Parallel()
+
+	const (
+		saturationTTL = 100 * time.Millisecond
+		noEndpointTTL = 2 * time.Second
+	)
+
+	t.Run("budget in force", func(t *testing.T) {
+		t.Parallel()
+
+		base := time.Now()
+		testCases := []struct {
+			name string
+			// itemTTL and noEndpointTTL default to the constants above when zero; use disabled to request an explicit
+			// zero, which is what disables eviction in that regime.
+			itemTTL       time.Duration
+			noEndpointTTL time.Duration
+			poolEmpty     bool
+			// regimeAfter is how long after enqueue the regime last changed; zero means it never has.
+			regimeAfter time.Duration
+			elapsed     time.Duration
+			wantOutcome types.QueueOutcome
+			wantExpired bool
+		}{
+			{
+				name:        "SaturatedPool_HoldsWithinSaturationBudget",
+				elapsed:     saturationTTL - time.Millisecond,
+				wantOutcome: types.QueueOutcomeEvictedTTL,
+				wantExpired: false,
+			},
+			{
+				name:        "SaturatedPool_ShedsAtSaturationBudget",
+				elapsed:     saturationTTL,
+				wantOutcome: types.QueueOutcomeEvictedTTL,
+				wantExpired: true,
+			},
+			{
+				name:        "EmptyPool_HoldsPastSaturationBudget",
+				poolEmpty:   true,
+				elapsed:     noEndpointTTL - time.Millisecond,
+				wantOutcome: types.QueueOutcomeEvictedNoEndpoints,
+				wantExpired: false,
+			},
+			{
+				name:        "EmptyPool_ShedsAtNoEndpointBudget",
+				poolEmpty:   true,
+				elapsed:     noEndpointTTL,
+				wantOutcome: types.QueueOutcomeEvictedNoEndpoints,
+				wantExpired: true,
+			},
+			{
+				name:          "EmptyPool_ZeroBudgetWaitsIndefinitely",
+				noEndpointTTL: -1, // Sentinel for an explicit zero; see the field comment.
+				poolEmpty:     true,
+				elapsed:       time.Hour,
+				wantOutcome:   types.QueueOutcomeEvictedNoEndpoints,
+				wantExpired:   false,
+			},
+			{
+				name:        "SaturatedPool_ZeroBudgetWaitsIndefinitely",
+				itemTTL:     -1, // Sentinel for an explicit zero; see the field comment.
+				elapsed:     time.Hour,
+				wantOutcome: types.QueueOutcomeEvictedTTL,
+				wantExpired: false,
+			},
+			{
+				// The pool comes up long after the saturation budget would have elapsed. Charging against an already
+				// spent budget would shed the request the instant it became dispatchable.
+				name:        "PoolCameUp_StartsFreshSaturationBudget",
+				regimeAfter: noEndpointTTL / 2,
+				elapsed:     noEndpointTTL/2 + saturationTTL - time.Millisecond,
+				wantOutcome: types.QueueOutcomeEvictedTTL,
+				wantExpired: false,
+			},
+			{
+				name:        "PoolCameUp_ShedsAfterFreshSaturationBudget",
+				regimeAfter: noEndpointTTL / 2,
+				elapsed:     noEndpointTTL/2 + saturationTTL,
+				wantOutcome: types.QueueOutcomeEvictedTTL,
+				wantExpired: true,
+			},
+			{
+				// A regime change before the request arrived must not extend its budget.
+				name:        "RegimeChangeBeforeEnqueue_DoesNotExtendBudget",
+				regimeAfter: -saturationTTL,
+				elapsed:     saturationTTL,
+				wantOutcome: types.QueueOutcomeEvictedTTL,
+				wantExpired: true,
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				itemTTL := saturationTTL
+				if tc.itemTTL != 0 {
+					itemTTL = max(tc.itemTTL, 0)
+				}
+				noEndpoint := noEndpointTTL
+				if tc.noEndpointTTL != 0 {
+					noEndpoint = max(tc.noEndpointTTL, 0)
+				}
+				var regimeSince time.Time
+				if tc.regimeAfter != 0 {
+					regimeSince = base.Add(tc.regimeAfter)
+				}
+
+				item := NewItem(fwkfcmocks.NewMockFlowControlRequest(100, "req-budget", testFlow), itemTTL, base)
+				regime := &regimeSample{empty: tc.poolEmpty, since: regimeSince}
+				outcome, expired := isExpired(item, base.Add(tc.elapsed), regime, noEndpoint)
+
+				assert.Equal(t, tc.wantOutcome, outcome, "expiry should be attributed to the regime in force")
+				assert.Equal(t, tc.wantExpired, expired, "the budget in force decides whether the request is shed")
+			})
+		}
+	})
+
+	t.Run("sweep holds a queued request across a scale-from-zero", func(t *testing.T) {
+		t.Parallel()
+		// --- ARRANGE ---
+		h := newTestHarness(t, testCleanupTick)
+		h.processor.noEndpointRequestTTL = noEndpointTTL
+		h.processor.regime.Store(&regimeSample{empty: true})
+
+		item := h.newTestItem("req-cold-start", testFlow, testShortTTL)
+		q := h.addQueue(testFlow)
+		require.NoError(t, q.Add(item), "Failed to add item to queue")
+
+		// --- ACT & ASSERT ---
+		// Well past the saturation budget, but the pool is empty, so the cold-start budget governs.
+		h.clock.Step(2 * testShortTTL)
+		h.processor.sweepFinalizedItems()
+		assert.Nil(t, item.FinalState(), "an empty pool must not shed against the saturation budget")
+		assert.Equal(t, 1, q.Len(), "the item should still be queued")
+
+		// The pool comes up. The request only now became dispatchable, so it gets a fresh saturation budget.
+		h.processor.regime.Store(&regimeSample{empty: false, since: h.clock.Now()})
+		h.processor.sweepFinalizedItems()
+		assert.Nil(t, item.FinalState(), "a request must not be shed the moment it becomes dispatchable")
+
+		h.clock.Step(testShortTTL)
+		h.processor.sweepFinalizedItems()
+		require.NotNil(t, item.FinalState(), "the fresh saturation budget should have elapsed")
+		assert.Equal(t, types.QueueOutcomeEvictedTTL, item.FinalState().Outcome,
+			"a shed under a non-empty pool is backpressure, not unavailability")
+		assert.Equal(t, 0, q.Len(), "the evicted item should be swept from the queue")
+	})
+
+	t.Run("sweep sheds an empty-pool request as unavailability", func(t *testing.T) {
+		t.Parallel()
+		// --- ARRANGE ---
+		h := newTestHarness(t, testCleanupTick)
+		h.processor.noEndpointRequestTTL = testShortTTL
+		h.processor.regime.Store(&regimeSample{empty: true})
+
+		// The saturation budget is long; only the no-endpoint budget can shed this request.
+		item := h.newTestItem("req-no-endpoints", testFlow, testTTL)
+		q := h.addQueue(testFlow)
+		require.NoError(t, q.Add(item), "Failed to add item to queue")
+
+		// --- ACT ---
+		h.clock.Step(testShortTTL)
+		h.processor.sweepFinalizedItems()
+
+		// --- ASSERT ---
+		require.NotNil(t, item.FinalState(), "the no-endpoint budget should have elapsed")
+		finalState := item.FinalState()
+		assert.Equal(t, types.QueueOutcomeEvictedNoEndpoints, finalState.Outcome,
+			"Outcome should be EvictedNoEndpoints")
+		assert.ErrorIs(t, finalState.Err, types.ErrEvicted, "Error should wrap ErrEvicted")
+		assert.ErrorIs(t, finalState.Err, types.ErrTTLExpired, "Error should wrap ErrTTLExpired")
+		assert.ErrorIs(t, finalState.Err, types.ErrNoEndpoints, "Error should wrap ErrNoEndpoints")
+		assert.Equal(t, 0, q.Len(), "the evicted item should be swept from the queue")
+		assert.Equal(t, uint64(1), h.processor.dropCounts[types.QueueOutcomeEvictedNoEndpoints].Load(),
+			"Drop should be recorded for EvictedNoEndpoints")
+	})
+
+	t.Run("dispatch cycle timestamps the regime change", func(t *testing.T) {
+		t.Parallel()
+		// --- ARRANGE ---
+		h := newTestHarness(t, testCleanupTick)
+		h.addQueue(testFlow)
+		ctx := context.Background()
+
+		// --- ACT & ASSERT ---
+		// The harness pool is non-empty; the first cycle establishes the regime without recording a change.
+		h.processor.dispatchCycle(ctx)
+		assert.False(t, h.processor.regime.Load().empty, "the harness pool starts non-empty")
+		assert.Zero(t, h.processor.regime.Load().since, "settling on the initial regime is not a change")
+
+		// The pool scales to zero.
+		h.clock.Step(testShortTTL)
+		h.endpointCandidates.Candidates = nil
+		h.processor.dispatchCycle(ctx)
+		require.True(t, h.processor.regime.Load().empty, "the pool should now read as empty")
+		scaledDown := h.processor.regime.Load().since
+		assert.Equal(t, h.clock.Now(), scaledDown, "the regime change should be timestamped")
+
+		// A cycle that does not change the regime leaves the timestamp alone, so the budget keeps running.
+		h.clock.Step(testShortTTL)
+		h.processor.dispatchCycle(ctx)
+		assert.Equal(t, scaledDown, h.processor.regime.Load().since,
+			"an unchanged regime must not restart the budget")
+	})
+}

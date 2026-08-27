@@ -11,11 +11,16 @@
 main
 bin/
 
+*debug_bin*
+
 # Test binary, built with `go test -c`
 *.test
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
+
+# Security scan report written by `make lint-security`
+gosec.sarif
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -28,8 +33,30 @@ go.work.sum
 .DS_Store
 .env
 
+# Agentic context files. Keep these out of version control to avoid unintentional changes to the context.
+CLAUDE.md
+AGENTS.md
+.gemini
+.claude
+.github/copilot-instructions.md
+
 # IDE files
 .idea
 .vscode
 
 vendor
+
+# Build output
+/build
+
+# Coverage reports (HTML; .out files are already covered by *.out above)
+/coverage
+/pd-sidecar*
+
+# Helm dependency artifacts
+config/charts/*/charts/
+config/charts/*/Chart.lock
+
+# Performance benchmark local results directory
+test/perf/__pycache__/
+test/perf/results/

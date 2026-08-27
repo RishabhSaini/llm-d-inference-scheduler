@@ -1,0 +1,38 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package datalayer
+
+import (
+	"context"
+
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+)
+
+// PoolInfo represents the DataStore information needed for endpoints.
+type PoolInfo interface {
+	PoolGet() (*EndpointPool, error)
+	PodList(func(fwkdl.Endpoint) bool) []fwkdl.Endpoint
+}
+
+// EndpointFactory defines an interface for managing Endpoint lifecycle. Specifically,
+// providing methods to allocate, update, and retire endpoints. This can potentially be
+// used for pooled memory or other management chores in the implementation.
+type EndpointFactory interface {
+	NewEndpoint(parent context.Context, inEndpointMetadata *fwkdl.EndpointMetadata) fwkdl.Endpoint
+	UpdateEndpoint(ctx context.Context, ep fwkdl.Endpoint)
+	ReleaseEndpoint(ep fwkdl.Endpoint)
+}

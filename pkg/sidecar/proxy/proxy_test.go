@@ -17,35 +17,42 @@ limitations under the License.
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
 	"time"
 
-	"github.com/llm-d/llm-d-inference-scheduler/pkg/common"
-	"github.com/llm-d/llm-d-inference-scheduler/test/sidecar/mock"
 	. "github.com/onsi/ginkgo/v2" // nolint:revive
 	. "github.com/onsi/gomega"    // nolint:revive
-	"k8s.io/klog/v2/ktesting"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
+	"github.com/llm-d/llm-d-router/test/sidecar/mock"
 )
+
+func newTestContext() context.Context {
+	logger := zap.New(
+		zap.WriteTo(GinkgoWriter),
+		zap.UseDevMode(true),
+	)
+	log.SetLogger(logger)
+	ctx := context.Background()
+	log.IntoContext(ctx, logger) // not strictly needed since we called SetLogger to set default
+	return ctx
+}
 
 var _ = Describe("Reverse Proxy", func() {
 	When("x-prefiller-url is not present", func() {
 		DescribeTable("should forward requests to decode server",
 
 			func(path string, secureProxy bool) {
-				_, ctx := ktesting.NewTestContext(GinkgoT())
 
-				var cert *tls.Certificate
-				if secureProxy {
-					tempCert, err := CreateSelfSignedTLSCertificate()
-					Expect(err).ToNot(HaveOccurred())
-					cert = &tempCert
-				}
+				ctx := newTestContext()
 
 				ackHandlerFn := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 					w.WriteHeader(200)
@@ -57,22 +64,26 @@ var _ = Describe("Reverse Proxy", func() {
 				targetURL, err := url.Parse(decodeBackend.URL)
 				Expect(err).ToNot(HaveOccurred())
 
-				cfg := Config{}
-				proxy := NewProxy("0", targetURL, cfg) // port 0 to automatically choose one that's available.
+				cfg := Config{
+					Port:          "0",
+					DecoderURL:    targetURL,
+					SecureServing: secureProxy,
+				}
+				proxy := NewProxy(cfg)
 
 				ctx, cancelFn := context.WithCancel(ctx)
-				defer cancelFn()
+				stoppedCh := make(chan struct{})
 
 				go func() {
 					defer GinkgoRecover()
 
-					validator := &AllowlistValidator{enabled: false}
-					err := proxy.Start(ctx, cert, validator)
+					proxy.allowlistValidator = &AllowlistValidator{enabled: false}
+					err := proxy.Start(ctx)
 					Expect(err).ToNot(HaveOccurred())
+					stoppedCh <- struct{}{}
 				}()
 
-				time.Sleep(1 * time.Second)
-				Expect(proxy.addr).ToNot(BeNil())
+				<-proxy.readyCh
 
 				tr := &http.Transport{
 					TLSClientConfig: &tls.Config{
@@ -99,16 +110,21 @@ var _ = Describe("Reverse Proxy", func() {
 				Expect(err).ToNot(HaveOccurred())
 
 				Expect(resp.StatusCode).To(BeNumerically("==", 200))
+
+				cancelFn()
+				<-stoppedCh
 			},
 
 			Entry("when the path is /v1/chat/completions and secure proxy is false", "/v1/chat/completions", false),
 			Entry("when the path is /v1/completions and secure proxy is false", "/v1/completions", false),
+			Entry("when the path is /v1/messages and secure proxy is false", "/v1/messages", false),
 			Entry("when the path is /v1/embeddings and secure proxy is false", "/v1/embeddings", false),
 			Entry("when the path is /score and secure proxy is false", "/score", false),
 			Entry("when the path is /healthz and secure proxy is false", "/healthz", false),
 
 			Entry("when the path is /v1/chat/completions and secure proxy is true", "/v1/chat/completions", true),
 			Entry("when the path is /v1/completions and secure proxy is true", "/v1/completions", true),
+			Entry("when the path is /v1/messages and secure proxy is true", "/v1/messages", true),
 			Entry("when the path is /v1/embeddings and secure proxy is true", "/v1/embeddings", true),
 			Entry("when the path is /score and secure proxy is true", "/score", true),
 			Entry("when the path is /healthz and secure proxy is true", "/healthz", true),
@@ -116,7 +132,6 @@ var _ = Describe("Reverse Proxy", func() {
 	})
 
 	When("x-prefiller-url is present", func() {
-		var ctx context.Context
 		var decodeBackend *httptest.Server
 		var decodeHandler *mock.ChatCompletionHandler
 		var prefillBackend *httptest.Server
@@ -124,8 +139,6 @@ var _ = Describe("Reverse Proxy", func() {
 		var decodeURL *url.URL
 
 		BeforeEach(func() {
-			_, ctx = ktesting.NewTestContext(GinkgoT())
-
 			// Decoder
 			decodeHandler = &mock.ChatCompletionHandler{
 				Role: mock.RoleDecode,
@@ -150,25 +163,28 @@ var _ = Describe("Reverse Proxy", func() {
 			var proxy *Server
 
 			BeforeEach(func() {
-				cfg := Config{Connector: ConnectorNIXLV2}
-				proxy = NewProxy("0", decodeURL, cfg) // port 0 to automatically choose one that's available.
+				cfg := Config{Port: "0", DecoderURL: decodeURL, KVConnector: KVConnectorNIXLV2}
+				proxy = NewProxy(cfg)
 
-				decodeHandler.Connector = ConnectorNIXLV2
-				prefillHandler.Connector = ConnectorNIXLV2
+				decodeHandler.Connector = KVConnectorNIXLV2
+				prefillHandler.Connector = KVConnectorNIXLV2
 			})
 
 			It("should successfully send request to 1. prefill 2. decode with the right fields (backward compatible behavior)", func() {
-				By("starting the proxy")
+				ctx := newTestContext()
+				ctx, cancelFn := context.WithCancel(ctx)
+				stoppedCh := make(chan struct{})
+
 				go func() {
 					defer GinkgoRecover()
 
-					validator := &AllowlistValidator{enabled: false}
-					err := proxy.Start(ctx, nil, validator)
+					proxy.allowlistValidator = &AllowlistValidator{enabled: false}
+					err := proxy.Start(ctx)
 					Expect(err).ToNot(HaveOccurred())
+					stoppedCh <- struct{}{}
 				}()
 
-				time.Sleep(1 * time.Second)
-				Expect(proxy.addr).ToNot(BeNil())
+				<-proxy.readyCh
 				proxyBaseAddr := "http://" + proxy.addr.String()
 
 				By("sending a /v1/chat/completions request with prefill header")
@@ -180,9 +196,9 @@ var _ = Describe("Reverse Proxy", func() {
         			"max_tokens": 50
 				}`
 
-				req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, strings.NewReader(body))
+				req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, bytes.NewReader([]byte(body)))
 				Expect(err).ToNot(HaveOccurred())
-				req.Header.Add(common.PrefillPodHeader, prefillBackend.URL)
+				req.Header.Add(routing.PrefillEndpointHeader, prefillBackend.URL)
 
 				_, err = http.DefaultClient.Do(req)
 				Expect(err).ToNot(HaveOccurred())
@@ -222,20 +238,26 @@ var _ = Describe("Reverse Proxy", func() {
 
 				Expect(drq1kv).To(HaveKey(requestFieldRemoteBlockIDs))
 				Expect(drq1kv).To(HaveKey(requestFieldRemoteEngineID))
+
+				cancelFn()
+				<-stoppedCh
 			})
 
 			It("should successfully send request to 1. prefill 2. decode with the right fields", func() {
-				By("starting the proxy")
+				ctx := newTestContext()
+				ctx, cancelFn := context.WithCancel(ctx)
+				stoppedCh := make(chan struct{})
+
 				go func() {
 					defer GinkgoRecover()
 
-					validator := &AllowlistValidator{enabled: false}
-					err := proxy.Start(ctx, nil, validator)
+					proxy.allowlistValidator = &AllowlistValidator{enabled: false}
+					err := proxy.Start(ctx)
 					Expect(err).ToNot(HaveOccurred())
+					stoppedCh <- struct{}{}
 				}()
 
-				time.Sleep(1 * time.Second)
-				Expect(proxy.addr).ToNot(BeNil())
+				<-proxy.readyCh
 				proxyBaseAddr := "http://" + proxy.addr.String()
 
 				By("sending a /v1/chat/completions request with prefill header")
@@ -247,9 +269,9 @@ var _ = Describe("Reverse Proxy", func() {
         			"max_tokens": 50
 				}`
 
-				req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, strings.NewReader(body))
+				req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, bytes.NewReader([]byte(body)))
 				Expect(err).ToNot(HaveOccurred())
-				req.Header.Add(common.PrefillPodHeader, prefillBackend.URL[len("http://"):])
+				req.Header.Add(routing.PrefillEndpointHeader, prefillBackend.URL[len("http://"):])
 
 				_, err = http.DefaultClient.Do(req)
 				Expect(err).ToNot(HaveOccurred())
@@ -289,6 +311,9 @@ var _ = Describe("Reverse Proxy", func() {
 
 				Expect(drq1kv).To(HaveKey(requestFieldRemoteBlockIDs))
 				Expect(drq1kv).To(HaveKey(requestFieldRemoteEngineID))
+
+				cancelFn()
+				<-stoppedCh
 			})
 		})
 	})

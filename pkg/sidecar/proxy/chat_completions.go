@@ -17,42 +17,214 @@ limitations under the License.
 package proxy
 
 import (
+	"context"
 	"net/http"
+	"strings"
+	"time"
 
-	"github.com/llm-d/llm-d-inference-scheduler/pkg/common"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 )
 
-var (
+// contextKey is a custom type for context keys to avoid collisions
+type contextKey string
+
+const requestStartTimeKey contextKey = "request_start_time"
+
+const (
 	// ChatCompletionsPath is the OpenAI chat completions path
 	ChatCompletionsPath = "/v1/chat/completions"
 
 	// CompletionsPath is the legacy completions path
 	CompletionsPath = "/v1/completions"
+
+	// ResponsesPath is the OpenAI Responses API path
+	ResponsesPath = "/v1/responses"
+
+	// MessagesPath is the Anthropic Messages API path
+	MessagesPath = "/v1/messages"
+
+	// GeneratePath is vLLM's token-in generate endpoint
+	GeneratePath = "/inference/v1/generate"
 )
 
-func (s *Server) chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
-	prefillPodHostPort := r.Header.Get(common.PrefillPodHeader)
+func openAIAPIAttr(apiType APIType) attribute.KeyValue {
+	return attribute.String("llm_d.openai.api", apiType.String())
+}
 
-	if prefillPodHostPort == "" {
-		s.logger.V(4).Info("skip disaggregated prefill")
+// disaggregatedPrefillHandler routes OpenAI-style requests: optional encoder (EPD) stage,
+// optional P/D prefill when the prefill header is set, otherwise decoder (or data-parallel).
+func (s *Server) disaggregatedPrefillHandler(apiType APIType) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		requestStart := time.Now()
+		tracer := tracing.Tracer(tracerScope)
+		ctx, span := tracer.Start(r.Context(), "forward_request",
+			trace.WithSpanKind(trace.SpanKindServer),
+		)
+		defer span.End()
 
-		if s.forwardDataParallel && !s.dataParallelHandler(w, r) {
+		// Tag this handler's log lines with the trace they belong to. The proxy
+		// logger is process-scoped, so seed it into the context first. Connectors
+		// reached from here still log through s.logger and stay uncorrelated;
+		// the request context carries the correlated logger for them to adopt.
+		ctx = tracing.LoggerWithSpanContext(log.IntoContext(ctx, s.logger), span)
+		logger := log.FromContext(ctx)
+
+		ctx = context.WithValue(ctx, requestStartTimeKey, requestStart)
+		r = r.WithContext(ctx)
+
+		requestPath := ""
+		if r.URL != nil {
+			requestPath = r.URL.Path
+		}
+		span.SetAttributes(
+			attribute.String("llm_d.pd_proxy.connector", s.config.KVConnector),
+			attribute.String("llm_d.pd_proxy.kv_connector", s.config.KVConnector),
+			attribute.String("llm_d.pd_proxy.ec_connector", s.config.ECConnector),
+			attribute.String("llm_d.pd_proxy.request_path", requestPath),
+			openAIAPIAttr(apiType),
+		)
+
+		prefillHostPorts := r.Header.Values(routing.PrefillEndpointHeader)
+		r.Header.Del(routing.PrefillEndpointHeader)
+
+		if len(prefillHostPorts) == 1 {
+			prefillHostPorts = strings.Split(prefillHostPorts[0], ",")
+		}
+
+		numHosts := len(prefillHostPorts)
+		var prefillHostPort string
+		if numHosts > 0 {
+			if s.config.EnablePrefillerSampling {
+				prefillHostPort = strings.TrimSpace(prefillHostPorts[s.prefillSamplerFn(numHosts)])
+			} else {
+				prefillHostPort = strings.TrimSpace(prefillHostPorts[0])
+			}
+		}
+
+		if len(prefillHostPort) == 0 {
+			logger.V(logging.DEBUG).Info("skip disaggregated prefill", "api", apiType.String())
+			span.SetAttributes(
+				attribute.Bool("llm_d.pd_proxy.disaggregation_used", false),
+				attribute.String("llm_d.pd_proxy.reason", "no_prefill_header"),
+			)
+		} else {
+			span.SetAttributes(
+				attribute.Bool("llm_d.pd_proxy.disaggregation_used", true),
+				attribute.String("llm_d.pd_proxy.prefill_target", prefillHostPort),
+				attribute.Int("llm_d.pd_proxy.prefill_candidates", numHosts),
+			)
+		}
+
+		if len(prefillHostPort) > 0 {
+			if !s.allowlistValidator.IsAllowed(prefillHostPort) {
+				logger.Error(nil, "SSRF protection: prefill target not in allowlist",
+					"target", prefillHostPort,
+					"clientIP", r.RemoteAddr,
+					"userAgent", r.Header.Get("User-Agent"),
+					"requestPath", r.URL.Path)
+				span.SetAttributes(
+					attribute.String("llm_d.pd_proxy.error", "ssrf_protection_denied"),
+					attribute.String("llm_d.pd_proxy.denied_target", prefillHostPort),
+				)
+				span.SetStatus(codes.Error, "SSRF protection: prefill target not in allowlist")
+				http.Error(w, "Forbidden: prefill target not allowed by SSRF protection", http.StatusForbidden)
+				return
+			}
+			logger.V(logging.DEBUG).Info("SSRF protection: prefill target allowed", "target", prefillHostPort)
+		}
+
+		kvCacheSource := strings.TrimSpace(r.Header.Get(routing.KVCacheSourceHeader))
+		r.Header.Del(routing.KVCacheSourceHeader)
+		if kvCacheSource != "" {
+			switch {
+			case !s.p2pPullAvailable():
+				logger.V(logging.DEBUG).Info("ignoring KV cache source header: connector does not support P2P pulls",
+					"connector", s.config.KVConnector)
+				kvCacheSource = ""
+			case !isHostPort(kvCacheSource):
+				logger.Info("ignoring malformed KV cache source header", "value", kvCacheSource)
+				kvCacheSource = ""
+			case !s.allowlistValidator.IsAllowed(kvCacheSource):
+				logger.Info("SSRF protection: KV cache source not in allowlist, ignoring",
+					"target", kvCacheSource, "clientIP", r.RemoteAddr)
+				kvCacheSource = ""
+			}
+		}
+		if kvCacheSource != "" {
+			span.SetAttributes(attribute.String("llm_d.pd_proxy.kv_cache_source", kvCacheSource))
+		}
+
+		encoderHostPorts := r.Header.Values(routing.EncoderEndpointsHeader)
+		r.Header.Del(routing.EncoderEndpointsHeader)
+		if len(encoderHostPorts) == 1 {
+			encoderHostPorts = strings.Split(encoderHostPorts[0], ",")
+		}
+
+		var allowedEncoders []string
+		if len(encoderHostPorts) > 0 {
+			allowedEncoders = make([]string, 0, len(encoderHostPorts))
+			for _, encoderHost := range encoderHostPorts {
+				encoderHost = strings.TrimSpace(encoderHost)
+				if s.allowlistValidator.IsAllowed(encoderHost) {
+					allowedEncoders = append(allowedEncoders, encoderHost)
+					logger.V(logging.DEBUG).Info("SSRF protection: encoder target allowed", "target", encoderHost)
+				} else {
+					logger.Info("SSRF protection: encoder target not in allowlist, removing from list",
+						"target", encoderHost,
+						"clientIP", r.RemoteAddr,
+						"userAgent", r.Header.Get("User-Agent"),
+						"requestPath", r.URL.Path)
+				}
+			}
+		}
+
+		if len(allowedEncoders) > 0 && s.handleECConnector != nil {
+			logger.V(logging.DEBUG).Info("encoder headers detected, using EC connector",
+				"encoderCount", len(allowedEncoders),
+				"encoderCandidates", len(encoderHostPorts),
+				"hasPrefiller", len(prefillHostPort) > 0)
+			span.SetAttributes(
+				attribute.Bool("llm_d.ec_proxy.encode_disaggregation_used", true),
+				attribute.Int("llm_d.ec_proxy.encoder_count", len(allowedEncoders)),
+				attribute.Int("llm_d.ec_proxy.encoder_candidates", len(encoderHostPorts)),
+			)
+			s.handleECConnector(w, r, prefillHostPort, allowedEncoders)
+			return
+		}
+
+		if len(encoderHostPorts) > 0 && len(allowedEncoders) == 0 {
+			logger.Info("SSRF protection: all encoder targets filtered out, falling back to P/D or decoder-only")
+			span.SetAttributes(
+				attribute.Bool("llm_d.ec_proxy.encode_disaggregation_used", false),
+				attribute.Int("llm_d.ec_proxy.encoder_allowed", len(allowedEncoders)),
+				attribute.Int("llm_d.ec_proxy.encoder_candidates", len(encoderHostPorts)),
+			)
+		}
+
+		if len(prefillHostPort) > 0 {
+			logger.V(logging.DEBUG).Info("using P/D protocol")
+			s.handlePDConnector(w, r, prefillHostPort, kvCacheSource, apiType)
+			return
+		}
+
+		logger.V(logging.DEBUG).Info("no prefiller or encoder, using decoder only")
+		if !s.forwardDataParallel || !s.dataParallelHandler(w, r) {
+			if kvCacheSource != "" {
+				s.decodeWithP2PSource(w, r, kvCacheSource)
+				return
+			}
+			if s.config.DecodeChunkSize > 0 && r.URL.Path == ChatCompletionsPath {
+				s.runChunkedDecode(w, r)
+				return
+			}
 			s.decoderProxy.ServeHTTP(w, r)
 		}
-		return
 	}
-
-	// SSRF Protection: Check if the prefill target is allowed
-	if !s.allowlistValidator.IsAllowed(prefillPodHostPort) {
-		s.logger.Error(nil, "SSRF protection: prefill target not in allowlist",
-			"target", prefillPodHostPort,
-			"clientIP", r.RemoteAddr,
-			"userAgent", r.Header.Get("User-Agent"),
-			"requestPath", r.URL.Path)
-		http.Error(w, "Forbidden: prefill target not allowed by SSRF protection", http.StatusForbidden)
-		return
-	}
-
-	s.logger.V(4).Info("SSRF protection: prefill target allowed", "target", prefillPodHostPort)
-	s.runConnectorProtocol(w, r, prefillPodHostPort)
 }

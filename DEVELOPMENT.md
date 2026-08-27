@@ -1,258 +1,801 @@
 # Development
 
-Documentation for developing the inference scheduler.
+Documentation for developing the llm-d Router.
+
+## Table of Contents
+
+- [Development](#development)
+  - [Table of Contents](#table-of-contents)
+  - [Overview](#overview)
+  - [Requirements](#requirements)
+  - [Kind Development Environment](#kind-development-environment)
+    - [Accessing the Gateway](#accessing-the-gateway)
+    - [Prometheus Monitoring](#prometheus-monitoring)
+    - [Development Cycle](#development-cycle)
+    - [Debugging](#debugging)
+    - [Inference Disaggregation Modes](#inference-disaggregation-modes)
+      - [1. EPD — No Disaggregation (default)](#1-epd--no-disaggregation-default)
+      - [2. Prefill/Decode (P/D) Disaggregation](#2-prefilldecode-pd-disaggregation)
+      - [3. Encode/Prefill-Decode (E/PD) Disaggregation](#3-encodeprefill-decode-epd-disaggregation)
+      - [4. Encode/Prefill/Decode (E/P/D) Disaggregation](#4-encodeprefilldecode-epd-disaggregation)
+      - [5. Disaggregated Setup Verification](#5-disaggregated-setup-verification)
+    - [Combining Scenarios with Data Parallel and KV Cache](#combining-scenarios-with-data-parallel-and-kv-cache)
+    - [Simulator vs Real vLLM](#simulator-vs-real-vllm)
+      - [Deploying with Simulator (default)](#deploying-with-simulator-default)
+      - [Deploying with Real vLLM](#deploying-with-real-vllm)
+      - [Deployment Component Summary](#deployment-component-summary)
+    - [Cleanup](#cleanup)
+  - [Running Tests](#running-tests)
+    - [Unit Tests](#unit-tests)
+    - [Integration Tests](#integration-tests)
+    - [Filtered Tests](#filtered-tests)
+    - [End-to-End Tests](#end-to-end-tests)
+    - [Coverage](#coverage)
+  - [Kubernetes Development Environment](#kubernetes-development-environment)
+    - [Infrastructure Setup](#infrastructure-setup)
+    - [RBAC and Permissions](#rbac-and-permissions)
+    - [Developer Setup](#developer-setup)
+    - [Environment Configuration](#environment-configuration)
+    - [Deploying Changes](#deploying-changes)
+    - [Cleanup Environment](#cleanup-environment)
+  - [Logging](#logging)
+    - [Change log verbosity](#change-log-verbosity)
+    - [Add logs](#add-logs)
+    - [Passing Logger Around](#passing-logger-around)
+  - [Submitting Changes](#submitting-changes)
+    - [Scope](#scope)
+    - [Presubmit](#presubmit)
+
+## Overview
+
+This repo builds the **Endpoint Picker Plugin (EPP)**, the inference scheduling component
+that routes requests to vLLM backends. The EPP runs alongside a Gateway API implementation
+and picks backends based on KV cache state, prefill locality, and load. A second binary,
+the **routing sidecar** (`cmd/pd-sidecar/`), handles disaggregation routing.
+
+The KIND environment is the easiest way to get started: one command, no cloud account.
+A real Kubernetes cluster setup is covered later for shared or production-like testing.
 
 ## Requirements
 
 - [Make] `v4`+
-- [Golang] `v1.24`+
+- [Golang] `v1.25`+
 - [Docker] (or [Podman])
 - [Kubernetes in Docker (KIND)]
-- [Kustomize]
+- [Kubectl] `v1.25`+
 
 [Make]:https://www.gnu.org/software/make/
 [Golang]:https://go.dev/
 [Docker]:https://www.docker.com/
 [Podman]:https://podman.io/
 [Kubernetes in Docker (KIND)]:https://github.com/kubernetes-sigs/kind
-[Kustomize]:https://kubectl.docs.kubernetes.io/installation/kustomize/
+[Kubectl]:https://kubectl.docs.kubernetes.io/installation/kubectl/
 
 ## Kind Development Environment
 
-The following deployment creates a [Kubernetes in Docker (KIND)] cluster with an inference scheduler using a Gateway API implementation, connected to the vLLM simulator.
-To run the deployment, use the following command:
+Deploys the EPP, vLLM simulator, and Gateway API implementation into a local KIND cluster:
 
 ```bash
 make env-dev-kind
 ```
 
-This will create a `kind` cluster (or re-use an existing one) using the system's
-local container runtime and deploy the development stack into the `default`
-namespace.
+Creates a new `kind` cluster (or reuses an existing one) in the `default` namespace. The cluster name defaults to `KIND_CLUSTER_NAME` in `Makefile.kind.mk` (currently `$(PROJECT_NAME)-dev`), and the kubectl context is `kind-<cluster-name>`.
 
 > [!NOTE]
-> You can download the image locally using `docker pull ghcr.io/llm-d/llm-d-inference-sim:latest`, and the script will load it from your local Docker registry.
+> You can pre-pull external images to avoid slow downloads:
+> ```
+> docker pull ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
+> docker pull vllm/vllm-openai-cpu:v0.21.0
+> ```
 
-There are several ways to access the gateway:
+### Accessing the Gateway
 
-**Port forward**:
+Use port-forward for local development:
 
 ```bash
-$ kubectl --context llm-d-inference-scheduler-dev port-forward service/inference-gateway 8080:80
+kubectl --context kind-llm-d-router-dev \
+  port-forward service/inference-gateway-istio 8080:80
 ```
+
+The default model depends on the disaggregation scenario:
+- **EPD / P/D** (no encoder): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
+- **E/PD / E/P/D** (with encoder, `DISAGG_E=true`): `Qwen/Qwen3-VL-2B-Instruct`
+
+To confirm what model is available:
+
+```bash
+curl -s http://localhost:8080/v1/models | jq
+```
+
+Make a text completion request:
+
+```bash
+curl -s -w '\n' http://localhost:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"TinyLlama/TinyLlama-1.1B-Chat-v1.0","prompt":"hi","max_tokens":10,"temperature":0}' | jq
+```
+
+For multimodal scenarios (`DISAGG_E=true`), send an image request:
+
+```bash
+curl -s http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen3-VL-2B-Instruct",
+    "messages": [{"role":"user","content":[
+      {"type":"image_url","image_url":{"url":"https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/1200px-Cat03.jpg"}},
+      {"type":"text","text":"What is in this image?"}
+    ]}],
+    "max_tokens": 50
+  }' | jq
+```
+<details>
+<summary>Alternative access methods (NodePort, LoadBalancer)</summary>
 
 **NodePort**
 
-```bash
-# Determine the k8s node address
-$ kubectl --context llm-d-inference-scheduler-dev get node -o yaml | grep address
-# The service is accessible over port 80 of the worker IP address.
-```
-
-**LoadBalancer**
-
-```bash
-# Install and run cloud-provider-kind:
-$ go install sigs.k8s.io/cloud-provider-kind@latest && cloud-provider-kind &
-$ kubectl --context llm-d-inference-scheduler-dev get service inference-gateway
-# Wait for the LoadBalancer External-IP to become available. The service is accessible over port 80.
-```
-
-You can now make requests matching the IP:port of one of the access mode above:
-
-```bash
-$ curl -s -w '\n' http://<IP:port>/v1/completions -H 'Content-Type: application/json' -d '{"model":"food-review","prompt":"hi","max_tokens":10,"temperature":0}' | jq
-```
-
-By default the created inference gateway, can be accessed on port 30080. This can
-be overridden to any free port in the range of 30000 to 32767, by running the above
-command as follows:
+The gateway is also exposed as a NodePort and is exposed on your development machine on port 30080 by default. Override this at
+cluster creation time with any free port in the range 30000-32767:
 
 ```bash
 KIND_GATEWAY_HOST_PORT=<selected-port> make env-dev-kind
 ```
 
-**Where:** &lt;selected-port&gt; is the port on your local machine you want to use to
-access the inference gatyeway.
+The service is then accessible at `http://localhost:30080`.
+
+**LoadBalancer**
+
+```bash
+# Install and run cloud-provider-kind:
+go install sigs.k8s.io/cloud-provider-kind@latest && cloud-provider-kind &
+kubectl --context kind-llm-d-router-dev get service inference-gateway-istio
+# Wait for the LoadBalancer External-IP to become available.
+# The service is accessible over port 80.
+```
+
+</details>
+
+### Prometheus Monitoring
+
+To deploy Prometheus alongside the dev environment:
+
+```bash
+PROM_ENABLED=true make env-dev-kind
+```
+
+Prometheus will be accessible at `http://localhost:30090`. To use a different host port:
+
+```bash
+PROM_ENABLED=true KIND_PROM_HOST_PORT=30091 make env-dev-kind
+```
+
+Grafana dashboards for the llm-d Router live in the
+[llm-d monorepo](https://github.com/llm-d/llm-d/tree/main/guides/recipes/observability/grafana/dashboards).
+See [Observability Setup](https://github.com/llm-d/llm-d/blob/main/docs/operations/observability/setup.md)
+for install and import instructions.
 
 > [!NOTE]
-> If you require significant customization of this environment beyond
-> what the standard deployment provides, you can use the `deploy/components`
-> with `kustomize` to build your own highly customized environment. You can use
-> the `deploy/environments/kind` deployment as a reference for your own.
-
-[Kubernetes in Docker (KIND)]:https://github.com/kubernetes-sigs/kind
+> For significant customization beyond the standard deployment, use the `deploy/components`
+> directory with `kubectl kustomize`. The `deploy/environments/kind` deployment is a useful
+> reference.
 
 ### Development Cycle
 
-To test your changes to `llm-d-inference-scheduler` in this environment, make your changes locally
-and then re-run the deployment:
+Edit your code, then rebuild and reload into the cluster:
 
 ```bash
 make env-dev-kind
 ```
 
-This will build images with your recent changes and load the new images to the
-cluster. By default the image tag will be `dev`. It will also load `llm-d-inference-sim` image.
-
-> [!NOTE]
->The built image tag can be specified via the `EPP_TAG` environment variable so it is used in the deployment. For example:
+This rebuilds the EPP image (tagged `dev` by default) and loads it into the cluster.
+To use a specific tag:
 
 ```bash
 EPP_TAG=0.0.4 make env-dev-kind
 ```
 
-> [!NOTE]
-> If you want to load a different tag of llm-d-inference-sim, you can use the environment variable `VLLM_SIMULATOR_TAG` to specify it.
-
-> [!NOTE]
-> If you are working on a MacOS with Apple Silicon, it is required to add the environment variable `GOOS=linux`.
-
-Then do a rollout of the EPP `Deployment` so that your recent changes are
-reflected:
+Then restart the deployment to pick up the new image:
 
 ```bash
-kubectl rollout restart deployment food-review-endpoint-picker
+kubectl rollout restart deployment tinyllama-1-1b-chat-v1-0-endpoint-picker
 ```
+
+> [!NOTE]
+> Images are built with debug symbols stripped (`-s -w`) by default. To produce a
+> debuggable image for use with `dlv`, override `LDFLAGS`:
+> ```bash
+> LDFLAGS="" make image-build-epp
+> ```
+> To load a different vLLM simulator tag, set `VLLM_SIMULATOR_TAG`:
+> ```bash
+> VLLM_SIMULATOR_TAG=<tag> make env-dev-kind
+> ```
+
+### Debugging
+
+**Building a debug image**
+
+Debug symbols are stripped by default (`-s -w`). To build an image with symbols preserved
+(required for `dlv` or other debuggers), clear `LDFLAGS`:
+
+```bash
+LDFLAGS="" make image-build-epp
+```
+
+To use a non-default runtime base image (e.g. a UBI variant or a debug-capable image),
+set `BASE_IMAGE`:
+
+```bash
+BASE_IMAGE=registry.access.redhat.com/ubi9/ubi-micro:9.7 make image-build-epp
+```
+
+Both overrides can be combined:
+
+```bash
+LDFLAGS="" BASE_IMAGE=registry.access.redhat.com/ubi9/ubi-micro:9.7 make image-build-epp
+```
+
+> [!NOTE]
+> The default base image is `gcr.io/distroless/static:nonroot`. If you switch to `scratch`,
+> you must copy CA certificates from the builder stage manually - see the comments in
+> `Dockerfile.epp` for guidance.
+
+**Attaching an ephemeral debug container**
+
+The distroless runtime image has no shell. For ad-hoc inspection (filesystem, processes,
+network), attach an ephemeral container without modifying the image:
+
+```bash
+kubectl debug -it <pod-name> -n <namespace> \
+    --image=busybox \
+    --target=epp \
+    -- sh
+```
+
+This creates a throwaway container that shares the pod's PID/network/filesystem namespace.
+Ephemeral container support requires Kubernetes 1.23+.
+
+To connect `dlv` to a running EPP process, build and deploy a debug image first (see above),
+then attach `dlv` via the ephemeral container:
+
+```bash
+# 1. Build and load the debug image
+LDFLAGS="" make image-build-epp
+kind load docker-image $(EPP_IMAGE) --name llm-d-router-dev
+
+# 2. Restart the deployment to pick up the new image
+kubectl rollout restart deployment tinyllama-1-1b-chat-v1-0-endpoint-picker
+
+# 3. Attach dlv in an ephemeral container
+kubectl debug -it <pod-name> -n <namespace> \
+    --image=ghcr.io/go-delve/delve:latest \
+    --target=epp \
+    -- dlv attach 1
+```
+
+> [!NOTE]
+> `dlv attach 1` assumes the EPP binary is PID 1. Confirm with `ps` in a `busybox`
+> ephemeral container if the pod runs additional processes.
+
+### Inference Disaggregation Modes
+
+The deployment uses three atomic Kustomize components (`vllm-encode`, `vllm-prefill`,
+`vllm-decode`) that compose to form any disaggregation scenario. Disaggregation is
+controlled by two independent boolean flags:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `DISAGG_E` | `false` | Deploy a separate **Encoder** pod |
+| `DISAGG_P` | `false` | Deploy a separate **Prefill** pod |
+
+The combination of these flags determines the scenario:
+
+| `DISAGG_E` | `DISAGG_P` | Scenario | Components |
+|---|---|---|---|
+| `false` | `false` | EPD (default) | decode only |
+| `false` | `true` | P/D | prefill + decode |
+| `true` | `false` | E/PD | encode + decode |
+| `true` | `true` | E/P/D | encode + prefill + decode |
+
+Data parallel and KV cache are orthogonal options that can be combined with any scenario:
+
+| Variable | Default | Description |
+|---|---|---|
+| `VLLM_DATA_PARALLEL_SIZE` | `1` | Number of data-parallel ranks per vLLM pod. Applies to ALL pod types (encode, prefill, decode). Set to `2`+ to enable |
+| `KV_CACHE_ENABLED` | `false` | Enable KV cache-aware scheduling |
+| `VLLM_EXTRA_ARGS_E` | _(empty)_ | Additional flags appended to the Encoder vLLM container args. Use `--flag=value` format. Example: `--mm-processor-kwargs={}` |
+| `VLLM_EXTRA_ARGS_P` | _(empty)_ | Additional flags appended to the Prefill vLLM container args. Use `--flag=value` format. Example: `--gpu-memory-utilization=0.9` |
+| `VLLM_EXTRA_ARGS_D` | _(empty)_ | Additional flags appended to the Decode vLLM container args. Use `--flag=value` format. Example: `--tensor-parallel-size=2` |
+
+For technical details, refer to [docs/disaggregation.md](docs/disaggregation.md) and
+[deploy/environments/dev/README.md](deploy/environments/dev/README.md).
+
+#### 1. EPD — No Disaggregation (default)
+
+Unified deployment handling all stages (encode, prefill, decode) in a single pod. No separate encoder or prefill pods:
+
+```bash
+make env-dev-kind
+```
+
+Verify:
+```bash
+curl -s http://localhost:30080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"TinyLlama/TinyLlama-1.1B-Chat-v1.0","prompt":"hi","max_tokens":10}' | jq
+```
+
+#### 2. Prefill/Decode (P/D) Disaggregation
+
+Separate Prefill and Decode pods:
+
+```bash
+DISAGG_P=true make env-dev-kind
+```
+
+> **Note:** The legacy `PD_ENABLED=true` is deprecated. Use `DISAGG_P=true` instead.
+
+Verify:
+```bash
+curl -s http://localhost:30080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"TinyLlama/TinyLlama-1.1B-Chat-v1.0","prompt":"hi","max_tokens":10}' | jq
+```
+
+#### 3. Encode/Prefill-Decode (E/PD) Disaggregation
+
+Separate Encoder pods; Prefill and Decode combined. Defaults to `Qwen/Qwen3-VL-2B-Instruct` for multimodal support:
+
+```bash
+DISAGG_E=true make env-dev-kind
+```
+
+Verify with an image request:
+```bash
+curl -s http://localhost:30080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen3-VL-2B-Instruct",
+    "messages": [{"role":"user","content":[
+      {"type":"image_url","image_url":{"url":"https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/1200px-Cat03.jpg"}},
+      {"type":"text","text":"What is in this image?"}
+    ]}],
+    "max_tokens": 50
+  }' | jq
+```
+
+#### 4. Encode/Prefill/Decode (E/P/D) Disaggregation
+
+Fully disaggregated — separate Encoder, Prefill, and Decode pods. Defaults to `Qwen/Qwen3-VL-2B-Instruct`:
+
+```bash
+DISAGG_E=true DISAGG_P=true make env-dev-kind
+```
+
+> **Note:** The legacy `EPD_ENABLED=true` is deprecated. Use `DISAGG_E=true DISAGG_P=true` instead.
+
+Verify with an image request:
+```bash
+curl -s http://localhost:30080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen3-VL-2B-Instruct",
+    "messages": [{"role":"user","content":[
+      {"type":"image_url","image_url":{"url":"https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/1200px-Cat03.jpg"}},
+      {"type":"text","text":"What is in this image?"}
+    ]}],
+    "max_tokens": 50
+  }' | jq
+```
+
+#### 5. Disaggregated Setup Verification
+
+After deploying any disaggregation mode, verify with a basic request:
+
+```bash
+kubectl --context kind-llm-d-router-dev port-forward service/inference-gateway-istio 8080:80
+```
+
+For multimodal disaggregation (E/PD, E/P/D), test with an image request to verify the encoder stage is working:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-VL-2B-Instruct",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          { "type": "image_url", "image_url": { "url": "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/1200px-Cat03.jpg" } },
+          { "type": "text", "text": "What is in this image?" }
+        ]
+      }
+    ],
+    "max_tokens": 100
+  }'
+```
+
+### Combining Scenarios with Data Parallel and KV Cache
+
+```bash
+# P/D with 2-rank data parallel decode
+DISAGG_P=true VLLM_DATA_PARALLEL_SIZE=2 make env-dev-kind
+
+# EPD with KV cache-aware scheduling
+KV_CACHE_ENABLED=true make env-dev-kind
+
+# Fully disaggregated E/P/D with data parallel and KV cache
+DISAGG_E=true DISAGG_P=true VLLM_DATA_PARALLEL_SIZE=2 KV_CACHE_ENABLED=true make env-dev-kind
+```
+
+### Simulator vs Real vLLM
+
+The `deploy/components/` directory contains all reusable Kustomize components:
+
+**vLLM workload components** — the base pods, split into three atomic building blocks:
+- `vllm-encode/` — Encoder pod (multimodal, `--mm-encoder-only`)
+- `vllm-prefill/` — Prefill pod
+- `vllm-decode/` — Decode pod with routing sidecar
+
+**Deployment overlays** — applied on top of the base components:
+- `overlays/simulator/` — adds `--mode=${VLLM_SIM_MODE}`, KV cache args, and `--zmq-endpoint` on Decode. Included by default in all dev scenario overlays.
+- `overlays/real-vllm/` — adds `--kv-events-config` on Decode, `--ec-transfer-config` on Encode, and a shared PVC for encoder embeddings.
+
+**Infrastructure components** — shared cluster infrastructure:
+- `inference-gateway/` — Endpoint Picker (EPP) deployment, services, RBAC, InferencePool, Gateway, and HTTPRoute
+- `istio-control-plane/` — Istiod control plane (namespaces, configmaps, RBAC, webhooks)
+- `monitoring/` — Prometheus ServiceMonitors for EPP and vLLM metrics
+- `crds-gateway-api/` — Gateway API CRDs
+- `crds-gie/` — Gateway API Inference Extension CRDs
+- `crds-istio/` — Istio CRDs
+
+#### Deploying with Simulator (default)
+
+The dev scenario overlays include the simulator component by default. No extra flags needed:
+
+```bash
+# EPD — no disaggregation (default)
+make env-dev-kind
+
+# P/D — prefill + decode
+DISAGG_P=true make env-dev-kind
+
+# E/PD — encode + prefill-decode
+DISAGG_E=true make env-dev-kind
+
+# E/P/D — encode + prefill + decode (fully disaggregated)
+DISAGG_E=true DISAGG_P=true make env-dev-kind
+
+# Any mode with data parallel
+VLLM_DATA_PARALLEL_SIZE=2 make env-dev-kind
+DISAGG_P=true VLLM_DATA_PARALLEL_SIZE=2 make env-dev-kind
+```
+
+#### Deploying with Real vLLM
+
+> [!NOTE]
+> The section will be updated soon
+
+The `deploy/components/overlays/real-vllm/` component is ready to use. It provides
+all the real vLLM-specific configuration (KV events, EC transfer, shared PVC). To use
+it, create a scenario overlay that includes it instead of the simulator overlay.
+For example, to deploy P/D with real vLLM:
+
+```yaml
+# deploy/environments/prod/p-d/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- ../../../components/vllm-prefill/
+- ../../../components/vllm-decode/
+
+patches:
+- path: ../../dev/p-d/patch-decode.yaml    # reuse scenario patches
+
+components:
+- ../../../components/overlays/real-vllm/  # real vLLM instead of simulator
+```
+
+Then deploy with:
+
+```bash
+VLLM_IMAGE=vllm/vllm-openai:v0.21.0 \
+  kubectl kustomize deploy/environments/prod/p-d \
+  | envsubst | kubectl apply -f -
+```
+
+For encode disaggregation scenarios (E/PD, E/P/D), the `real-vllm` overlay automatically
+adds `--kv-events-config` to the Decode deployment (per-pod ZMQ publisher for KV cache
+events), `--ec-transfer-config` (producer role) to the Encode deployment, and creates
+a shared PVC (`ec-cache-pvc`) for encoder embeddings transfer.
+
+#### Deployment Component Summary
+
+| Component | What it adds | When to use |
+|---|---|---|
+| `overlays/simulator/` | `--mode=${VLLM_SIM_MODE}`, KV cache args, `--zmq-endpoint` on Decode | Dev/test with simulator image |
+| `overlays/real-vllm/` | `--kv-events-config` on Decode (per-pod ZMQ publisher), `--ec-transfer-config` on Encode, ec-cache PVC | Production with real vLLM image |
+
+| Variable | Default | Description |
+|---|---|---|
+| `VLLM_IMAGE` | `ghcr.io/llm-d/llm-d-inference-sim:v0.10.2` | vLLM container image to deploy. Can be a simulator or a real vLLM image (e.g., `vllm/vllm-openai:v0.16.0`). Defaults to the simulator image. |
+| `VLLM_SIM_MODE` | `echo` | Simulator response mode. `echo` returns the input prompt as the response (useful for routing validation). `random` returns random sentences from a pre-defined bank. Only applies when using the simulator overlay. |
+
+### Cleanup
+
+```bash
+make clean-env-dev-kind
+```
+
+> [!NOTE]
+> Port mappings (`KIND_GATEWAY_HOST_PORT`, `KIND_PROM_HOST_PORT`) are baked into the cluster
+> at creation time. To change them, run `make clean-env-dev-kind` first, then recreate.
+
+## Running Tests
+
+### Unit Tests
+
+Coverage and race detection are always enabled.
+
+```bash
+make test-unit          # run all unit tests (epp + sidecar)
+make test-unit-epp      # epp only
+make test-unit-sidecar  # sidecar only
+```
+
+### Integration Tests
+
+Requires the KIND development environment to be running (`make env-dev-kind`).
+
+```bash
+make test-integration   # coverage and race detection always enabled
+```
+
+### Filtered Tests
+
+```bash
+make test-filter PATTERN=TestName           # epp tests matching pattern
+make test-filter PATTERN=TestName TYPE=sidecar
+```
+
+### End-to-End Tests
+
+```bash
+make test-e2e
+```
+
+This creates a temporary Kind cluster named `e2e-tests`, runs the full test suite against it, and deletes the cluster on completion.
+
+**Keeping the cluster on failure**
+
+Set `E2E_KEEP_CLUSTER_ON_FAILURE=true` to preserve the cluster (and, when using a real cluster, all created Kubernetes objects) when any test fails. This is useful for inspecting pod logs, events, or cluster state after a failure.
+
+```bash
+E2E_KEEP_CLUSTER_ON_FAILURE=true make test-e2e
+```
+
+When set, a successful run still cleans up normally — the cluster is only kept if there is at least one test failure.
+
+**Accessing the cluster after a failure**
+
+E2E tests do not update the host's kubeconfig to point at the `e2e-tests` Kind cluster. After a preserved failure, export the kubeconfig manually:
+
+```bash
+# Merge into the default kubeconfig ($HOME/.kube/config or $KUBECONFIG)
+kind export kubeconfig --name e2e-tests
+
+# Or write to a specific file
+kind export kubeconfig --name e2e-tests --kubeconfig /path/to/kubeconfig
+```
+
+Then use it as normal:
+
+```bash
+kubectl --context kind-e2e-tests get pods
+```
+
+**Environment variables**
+
+| Variable | Default | Description |
+|---|---|---|
+| `E2E_KEEP_CLUSTER_ON_FAILURE` | `false` | Preserve the Kind cluster (or Kubernetes objects) when the suite fails |
+| `E2E_PORT` | `30080` | Host port mapped to the gateway NodePort |
+| `E2E_METRICS_PORT` | `32090` | Host port mapped to the EPP metrics NodePort |
+| `K8S_CONTEXT` | _(empty)_ | Use an existing cluster context instead of creating a Kind cluster |
+| `NAMESPACE` | `default` | Namespace to deploy test resources into |
+| `CONTAINER_RUNTIME` | `docker` | Container runtime used to load images into Kind (`docker` or `podman`) |
+| `READY_TIMEOUT` | `3m` | How long to wait for resources to become ready |
+| `EPP_IMAGE` | `ghcr.io/llm-d/llm-d-router-endpoint-picker:dev` | EPP image loaded into the Kind cluster |
+| `DISAGG_E` | `false` | Deploy a separate Encoder pod. See [Inference Disaggregation Modes](#inference-disaggregation-modes) |
+| `DISAGG_P` | `false` | Deploy a separate Prefill pod. See [Inference Disaggregation Modes](#inference-disaggregation-modes) |
+| `VLLM_DATA_PARALLEL_SIZE` | `1` | Number of data-parallel ranks per vLLM pod. Applies to all pod types. Set to `2`+ to enable multi-rank inference. See [Combining Scenarios with Data Parallel and KV Cache](#combining-scenarios-with-data-parallel-and-kv-cache) |
+| `VLLM_EXTRA_ARGS_E` | _(empty)_ | Additional flags for the Encoder vLLM container (e.g. `--mm-processor-kwargs={}`) |
+| `VLLM_EXTRA_ARGS_P` | _(empty)_ | Additional flags for the Prefill vLLM container (e.g. `--gpu-memory-utilization=0.9`) |
+| `VLLM_EXTRA_ARGS_D` | _(empty)_ | Additional flags for the Decode vLLM container (e.g. `--tensor-parallel-size=2`) |
+| `VLLM_IMAGE` | `ghcr.io/llm-d/llm-d-inference-sim:v0.10.2` | vLLM container image to deploy. Can be a simulator or a real vLLM image (e.g., `vllm/vllm-openai:v0.16.0`) |
+| `VLLM_SIM_MODE` | `echo` | Simulator response mode. Supported values: `echo` (returns the input prompt as the response), `random` (returns a random sentence from a pre-defined bank) |
+| `SIDECAR_IMAGE` | `ghcr.io/llm-d/llm-d-router-disagg-sidecar:dev` | Routing sidecar image loaded into the Kind cluster |
+| `VLLM_RENDER_IMAGE` | `vllm/vllm-openai-cpu:v0.21.0` | vLLM renderer image loaded into the Kind cluster |
+
+### Coverage
+
+Coverage profiles are written to `coverage/` (gitignored). To generate an HTML report:
+
+```bash
+make coverage-report
+open coverage/epp.html
+```
+
+To compare coverage against `main`:
+
+```bash
+make test-unit          # run tests on your branch first
+make coverage-compare   # builds a baseline from main in a temp worktree, then diffs
+```
+
+To compare against a different ref:
+
+```bash
+make coverage-compare BASE_REF=release-0.5
+```
+
+To compare against multiple baselines in one session:
+
+```bash
+make test-unit
+make coverage-compare                                              # vs main
+make coverage-compare BASE_REF=release-0.6 COVERAGE_LABEL=release-0.6
+```
+
+If a worktree for the target ref already exists locally it is reused and not removed afterwards. A newly created worktree is always cleaned up after the comparison.
+
+> [!NOTE]
+> CI runs the same comparison automatically on every PR: one report against `main`
+> and one against the most recent `release-*` branch. Both appear in the GitHub
+> Actions Job Summary for the run.
 
 ## Kubernetes Development Environment
 
-A Kubernetes cluster can be used for development and testing.
-The setup can be split in two:
+A real Kubernetes cluster can be used for development and testing. Setup has two layers:
 
-- cluster-level infrastructure deployment (e.g., CRDs), and
-- deployment of development environments on a per-namespace basis
+- **Cluster infrastructure**: CRDs and operators, installed once by a cluster admin.
+- **Developer environment**: your namespace and workloads.
 
-This enables cluster sharing by multiple developers. In case of private/personal
-clusters, the `default` namespace can be used directly.
+On a shared cluster, each developer uses a separate namespace. On a personal cluster,
+`default` works fine.
 
-### Setup - Infrastructure
+### Infrastructure Setup
 
 > [!CAUTION]
-> In shared cluster situations you should probably not be
-> running this unless you're the cluster admin and you're _certain_
-> that you should be running this, as this can be disruptive to other developers
-> in the cluster.
+> Only run this if you are the cluster admin. Applying CRDs and operators can be disruptive
+> to other developers sharing the cluster.
 
-The following will deploy all the infrastructure-level requirements (e.g. CRDs,
-Operators, etc.) to support the namespace-level development environments:
-
-Install Gateway API + GIE CRDs:
+Install Gateway API and GIE CRDs:
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.3.0/standard-install.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/latest/download/manifests.yaml
 ```
 
 Install kgateway:
+
 ```bash
 KGTW_VERSION=v2.0.2
-helm upgrade -i --create-namespace --namespace kgateway-system --version $KGTW_VERSION kgateway-crds oci://cr.kgateway.dev/kgateway-dev/charts/kgateway-crds
-helm upgrade -i --namespace kgateway-system --version $KGTW_VERSION kgateway oci://cr.kgateway.dev/kgateway-dev/charts/kgateway --set inferenceExtension.enabled=true
+helm upgrade -i --create-namespace --namespace kgateway-system --version $KGTW_VERSION \
+  kgateway-crds oci://cr.kgateway.dev/kgateway-dev/charts/kgateway-crds
+helm upgrade -i --namespace kgateway-system --version $KGTW_VERSION \
+  kgateway oci://cr.kgateway.dev/kgateway-dev/charts/kgateway \
+  --set inferenceExtension.enabled=true
 ```
 
-For more details, see the Gateway API inference Extension [getting started guide](https://gateway-api-inference-extension.sigs.k8s.io/guides/)
+For more details, see the Gateway API Inference Extension
+[getting started guide](https://gateway-api-inference-extension.sigs.k8s.io/guides/).
 
-### Setup - Developer Environment
+### RBAC and Permissions
+
+EPP is namespace-scoped. Its `Role` grants `get/watch/list` on `inferencepools` and `pods`,
+plus `create` on `tokenreviews`/`subjectaccessreviews` for metrics auth
+(`--metrics-endpoint-auth=true`, the default). To disable metrics auth and avoid the
+cluster-scoped RBAC requirement, use `--metrics-endpoint-auth=false`.
+
+### Developer Setup
 
 > [!NOTE]
-> This setup is currently very manual in regards to container
-> images for the VLLM simulator and the EPP. It is expected that you build and
-> push images for both to your own private registry. In future iterations, we
-> will be providing automation around this to make it simpler.
+> This setup requires building and pushing container images to your own private registry.
 
-To deploy a development environment to the cluster, you'll need to explicitly
-provide a namespace. This can be `default` if this is your personal cluster,
-but on a shared cluster you should pick something unique. For example:
+**1. Set your namespace.**
 
 ```bash
-export NAMESPACE=annas-dev-environment
-```
-
-Create the namespace:
-
-```bash
+export NAMESPACE=your-dev-namespace
 kubectl create namespace ${NAMESPACE}
-```
-
-Set the default namespace for kubectl commands
-
-```bash
 kubectl config set-context --current --namespace="${NAMESPACE}"
 ```
 
 > [!NOTE]
-> If you are using OpenShift (oc CLI), you can use the following instead: `oc project "${NAMESPACE}"`
+> If you are using OpenShift, use `oc project "${NAMESPACE}"` instead.
 
-- Set Hugging Face token variable:
+**2. Set your Hugging Face token.**
 
-```bash
-export HF_TOKEN="<HF_TOKEN>"
-```
-
-Download the `llm-d-kv-cache-manager` repository (the installation script and Helm chart to install the vLLM environment):
+Required to pull model weights. Get one at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens):
 
 ```bash
-cd .. && git clone git@github.com:llm-d/llm-d-kv-cache-manager.git
+export HF_TOKEN="<your-token>"
 ```
 
-If you prefer to clone it into the `/tmp` directory, make sure to update the `VLLM_CHART_DIR` environment variable:
-`export VLLM_CHART_DIR=<tmp_dir>/llm-d-kv-cache-manager/vllm-setup-helm`
+**3. Clone the `llm-d-kv-cache` repository.**
 
-Once all this is set up, you can deploy the environment:
+The Makefile expects it as a sibling of this repo at `../llm-d-kv-cache`:
+
+```bash
+git clone git@github.com:llm-d/llm-d-kv-cache.git ../llm-d-kv-cache
+```
+
+If you clone it elsewhere, set:
+
+```bash
+export VLLM_CHART_DIR=<path>/llm-d-kv-cache/vllm-setup-helm
+```
+
+**4. Deploy:**
 
 ```bash
 make env-dev-kubernetes
 ```
 
-This will deploy the entire stack to whatever namespace you chose.
 > [!NOTE]
-> The model and images of each component can  be replaced. See [Environment Configuration](#environment-configuration) for model settings.
+> The model and images of each component can be replaced. See
+> [Environment Configuration](#environment-configuration) for details.
 
-You can test by exposing the `inference gateway` via port-forward:
+**5. Test the deployment.**
+
+Expose the gateway via port-forward:
 
 ```bash
 kubectl port-forward service/inference-gateway 8080:80 -n "${NAMESPACE}"
 ```
 
-And making requests with `curl`:
+Make a request:
 
 ```bash
-curl -s -w '\n' http://localhost:8080/v1/completions -H 'Content-Type: application/json' \
-  -d '{"model":"meta-llama/Llama-3.1-8B-Instruct","prompt":"hi","max_tokens":10,"temperature":0}' | jq
+curl -s -w '\n' http://localhost:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"TinyLlama/TinyLlama-1.1B-Chat-v1.0","prompt":"hi","max_tokens":10,"temperature":0}' \
+  | jq
 ```
 
 > [!NOTE]
-> If the response is empty or contains an error, jq may output a cryptic error. You can run the command without jq to debug raw responses.
+> If the response is empty or contains an error, jq may output a cryptic message.
+> Drop the `| jq` to see the raw response.
 
-#### Environment Configurateion
+### Environment Configuration
 
-**1. Setting the EPP image and tag:**
-
-You can optionally set a custom EPP image (otherwise, the default will be used):
+**1. EPP image registry and tag:**
 
 ```bash
+export IMAGE_REGISTRY="<YOUR_REGISTRY>"
 export EPP_TAG="<YOUR_TAG>"
-export EPP_IMAGE="<YOUR_REGISTRY>/<YOUR_IMAGE>"
 ```
 
-**2. Setting the vLLM replicas:**
+> [!NOTE]
+> The full image reference is `${IMAGE_REGISTRY}/llm-d-router-endpoint-picker:${EPP_TAG}`.
+> For example, with `IMAGE_REGISTRY=quay.io/<my-id>` and `EPP_TAG=v1.0.0`, the image
+> will be `quay.io/<my-id>/llm-d-router-endpoint-picker:v1.0.0`.
 
-You can optionally set the vllm replicas:
+**2. vLLM replica count:**
 
 ```bash
-export VLLM_REPLICA_COUNT=2
+export VLLM_REPLICA_COUNT_D=2
 ```
 
-**3. Setting the model name:**
-
-You can replace the model name that will be used in the system.
+**3. Model name:**
 
 ```bash
 export MODEL_NAME=mistralai/Mistral-7B-Instruct-v0.2
 ```
 
-If you need to deploy a larger model, update the vLLM-related parameters according to the model's requirements. For example:
+For larger models, set additional vLLM parameters:
 
 ```bash
 export MODEL_NAME=meta-llama/Llama-3.1-70B-Instruct
@@ -263,64 +806,61 @@ export VLLM_TENSOR_PARALLEL_SIZE=2
 export VLLM_GPU_COUNT_PER_INSTANCE=2
 ```
 
-**4. Additional environment settings:**
+**4. Additional settings:**
 
-More environment variable settings can be found in the `scripts/kubernetes-dev-env.sh`.
+More environment variables are documented in `scripts/kubernetes-dev-env.sh`.
 
-#### Development Cycle
+### Deploying Changes
 
-> [!Warning]
-> This is a very manual process at the moment. We expect to make
-> this more automated in future iterations.
+> [!WARNING]
+> This requires manual image builds and pushes to your private registry.
 
-Make your changes locally and commit them. Then select an image tag based on
-the `git` SHA and set your private registry:
+Build and push a new image:
 
 ```bash
 export EPP_TAG=$(git rev-parse HEAD)
 export IMAGE_REGISTRY="quay.io/<my-id>"
-```
-
-Build the image and tag the image for your private registry:
-
-```bash
 make image-build
-```
-
-and push it:
-
-```bash
 make image-push
 ```
 
-You can now re-deploy the environment with your changes (don't forget all of
-the required environment variables):
+Redeploy:
 
 ```bash
 make env-dev-kubernetes
 ```
 
-And test the changes.
+Test with a request:
+
+```bash
+kubectl port-forward service/inference-gateway 8080:80 -n "${NAMESPACE}"
+curl -s -w '\n' http://localhost:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"TinyLlama/TinyLlama-1.1B-Chat-v1.0","prompt":"hi","max_tokens":10,"temperature":0}' \
+  | jq
+```
 
 ### Cleanup Environment
 
-To clean up the development environment and remove all deployed resources in your namespace, run:
+Remove all deployed resources in your namespace:
 
 ```bash
 make clean-env-dev-kubernetes
 ```
 
-If you also want to remove the namespace entirely, run:
+To remove the namespace too:
 
 ```bash
 kubectl delete namespace ${NAMESPACE}
 ```
 
-To uninstall the infra-stracture development:
-Uninstal GIE CRDs:
+To uninstall the cluster infrastructure:
+
+Uninstall GIE CRDs:
 
 ```bash
-kubectl delete -f https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/latest/download/manifests.yaml --ignore-not-found
+kubectl delete -f https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/latest/download/manifests.yaml \
+  --ignore-not-found
 ```
 
 Uninstall kgateway:
@@ -330,4 +870,127 @@ helm uninstall kgateway -n kgateway-system
 helm uninstall kgateway-crds -n kgateway-system
 ```
 
-For more details, see the Gateway API inference Extension [getting started guide](https://gateway-api-inference-extension.sigs.k8s.io/guides/)
+For more details, see the Gateway API Inference Extension
+[getting started guide](https://gateway-api-inference-extension.sigs.k8s.io/guides/).
+
+## Logging
+
+We use `logr.Logger` interface for logging everywhere.
+The logger instance is loaded from `context.Context` or passed around as an argument directly.
+This is aligned with contextual logging as explained in [k8s instrumentation logging guidelines](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-instrumentation/logging.md).
+
+In other words, we explicitly don't use `klog` global logging calls.
+Using `klog` log value helpers like `klog.KObj` is just fine.
+
+### Change log verbosity
+
+We generally follow the [k8s instrumentation logging guidelines](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-instrumentation/logging.md), which states "the practical default level is V(2). Developers and QE environments may wish to run at V(3) or V(4)".
+
+To configure logging verbosity, specify the `v` flag such as `--v=2`.
+
+If `--v` is not set explicitly, the default verbosity is V(2) (`DEFAULT`).
+### Add logs
+
+The [k8s instrumentation logging guidelines](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-instrumentation/logging.md) have the following definitions:
+
+- `logger.V(0).Info` = `logger.Info` - Generally useful for this to **always** be visible to a cluster operator
+- `logger.V(1).Info` - A reasonable default log level if you don't want verbosity.
+- `logger.V(2).Info` - Useful steady state information about the service and important log messages that may correlate to significant changes in the system. This is the recommended default log level for most systems.
+- `logger.V(3).Info` - Extended information about changes
+- `logger.V(4).Info` - Debug level verbosity
+- `logger.V(5).Info` - Trace level verbosity
+
+We choose to simplify to the following 4 common levels.
+
+```go
+const (
+	DEFAULT = 2
+	VERBOSE = 3
+	DEBUG   = 4
+	TRACE   = 5
+)
+```
+
+The guidelines are written in the context of a k8s controller. Our [epp](pkg/epp/) does more things such as handling requests and scraping metrics, therefore we adapt the guidelines as follows:
+
+1. The server startup process and configuration.
+
+   - `logger.Info` Logging at the `V(0)` verbosity level is generally welcome here as this is only logged once at startup, and provides useful info for debugging.
+
+2. Reconciler loops. The reconciler loops watch for CR changes such as the `InferenceObjective` CR. And given changes in these CRs significantly affect the behavior of the extension, we recommend using `V(DEFAULT)` verbosity level as default, and sparsely use higher verbosity levels.
+
+   - `logger.V(DEFAULT)`
+     - Default log level in the reconcilers.
+     - Information about config (listening on X, watching Y)
+     - Errors that repeat frequently that relate to conditions that can be corrected (e.g., inference model not initialized yet)
+     - System state changing (adding/removing objects in the data store)
+   - `logger.V(VERBOSE)` and above: Use your best judgement.
+
+3. Inference request handling. These requests are expected to be much higher volume than the control flow in the reconcilers and therefore we should be mindful of log spamming. We recommend using v=2 to log important info about a request, such as the HTTP response code, and higher verbosity levels for less important info.
+
+   - `logger.V(DEFAULT)`
+     - Logging the status code of an HTTP request
+     - Important decision making such as picking the target model, target pod
+   - `logger.V(VERBOSE)`
+     - Detailed request scheduling algorithm operations, such as running the filtering logic
+   - `logger.V(DEBUG)` and above: Use your best judgement.
+
+4. Metric scraping loops. These loops run at a very high frequency, and logs can be very spammy if not handled properly.
+
+   - `logger.V(TRACE)`
+     - Transient errors/warnings, such as failure to get response from a pod.
+     - Important state changes, such as updating a metric.
+
+5. Misc
+   1. Periodic (every 5s) debug loop which prints the current pods and metrics.
+      - `logger.V(DEFAULT).Error` If the metrics are not fresh enough, which indicates an error occurred during the metric scraping loop.
+      - `logger.V(DEBUG)`
+        - This is very important to debug the request scheduling algorithm, and yet not spammy compared to the metric scraping loop logs.
+
+### Passing Logger Around
+
+You can pass around a `context.Context` that contains a logger or a `logr.Logger` instance directly.
+You need to make the call which one to use. Passing a `context.Context` is more standard, on the other hand you then need to call `log.FromContext` everywhere.
+
+As `logger.V` calls are cumulative, i.e. `logger.V(2).V(3)` results in `logger.V(5)`, a logger should be passed around with no verbosity level set so that `logger.V(DEFAULT)` actually uses `DEFAULT` verbosity level.
+
+## Submitting Changes
+
+Read the [llm-d organization contributing guide](https://github.com/llm-d/llm-d/blob/main/CONTRIBUTING.md)
+first — it covers project-wide guidelines, code of conduct, and community resources that apply across
+all llm-d repositories. The sections below describe router-repo-specific expectations on top of that
+baseline.
+
+### Scope
+
+Scoped changes and localized bug fixes can be submitted directly as a PR. 
+For larger changes please [create an issue](https://github.com/llm-d/llm-d-router/issues/new)
+first describing the change so the maintainers can do an assessment, and work on the details
+with you. Getting alignment on the requirements and approach is critical for getting your
+changes merged.
+
+Please call out any user facing changes your change will introduce, including changes to
+documentation, deployment guides, etc. If your changes replace and deprecate an existing feature,
+please be sure to consider that in your design and implementation.
+We follow an "N+2 deprecation" policy: features deprecated in release N must continue to work
+without user impact (e.g., configuration changes) for 2 releases and can be fully removed
+in release N+2. Use of a deprecated feature must produce a clear warning message in releases
+N and N+1, providing users with a two release grace period to adjust before the feature is removed.
+
+Please use the [template](.github/PULL_REQUEST_TEMPLATE.md) provided when creating a PR.
+If using coding agents, please ensure that the agent uses the PR template format as well.
+The template contains a `release-notes` section which must be filled for any change that has
+user facing impact.
+
+For additional information and context, please refer to the [llm-d contributing guide](https://github.com/llm-d/llm-d/blob/main/CONTRIBUTING.md)
+
+### Presubmit
+
+Before opening a PR, run:
+
+```bash
+make presubmit
+```
+
+This runs the same lint, vet, and test checks as the CI pipeline. Fixing failures locally
+saves a round-trip through GitHub Actions.

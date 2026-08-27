@@ -18,8 +18,11 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 )
+
+var errInvalidJSON = errors.New("invalid JSON")
 
 // vLLM error response
 type errorResponse struct {
@@ -48,6 +51,10 @@ func errorJSONInvalid(err error, w http.ResponseWriter) error {
 
 func errorBadGateway(err error, w http.ResponseWriter) error {
 	return sendError(err, "BadGateway", http.StatusBadGateway, w)
+}
+
+func errorInternalServerError(err error, w http.ResponseWriter) error {
+	return sendError(err, "InternalServerError", http.StatusInternalServerError, w)
 }
 
 // sendError simulates vLLM errors

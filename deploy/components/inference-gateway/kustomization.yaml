@@ -15,10 +15,6 @@ resources:
 - rbac.yaml
 - inference-pools.yaml
 - services.yaml
-- deployments.yaml
+- deployment.yaml
 - gateways.yaml
 - httproutes.yaml
-
-images:
-- name: ghcr.io/llm-d/llm-d-inference-scheduler
-  newTag: ${EPP_TAG}

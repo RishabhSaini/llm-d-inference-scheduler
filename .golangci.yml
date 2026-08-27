@@ -6,28 +6,127 @@ run:
 
 formatters:
   enable:
-  - goimports
-  - gofmt
+    - goimports
+    - gofmt
 
 linters:
   enable:
-  - copyloopvar
-  - dupword
-  - durationcheck
-  - fatcontext
-  - ginkgolinter
-  - gocritic
-  - govet
-  - loggercheck
-  - misspell
-  - perfsprint
-  - revive
-  - unconvert
-  - makezero
-  - errcheck
-  - goconst
-  - ineffassign
-  - nakedret
-  - prealloc
-  - unparam
-  - unused
+    - importas
+    - bodyclose
+    - copyloopvar
+    - dupword
+    - durationcheck
+    - errcheck
+    - fatcontext
+    - forbidigo
+    - ginkgolinter
+    - goconst
+    - gocritic
+    - govet
+    - ineffassign
+    - loggercheck
+    - makezero
+    - misspell
+    - nakedret
+    - nilnil
+    - perfsprint
+    - prealloc
+    - revive
+    - staticcheck
+    - unparam
+    - unused
+    - unconvert
+  exclusions:
+    presets:
+      - comments        # suppress missing comment violations on packages and exported symbols
+      - std-error-handling  # suppress unchecked errors on well-known stdlib patterns (e.g. Close())
+    rules:
+      # Package names inherited from GAIE upstream (common, types, utils, http) are intentional
+      - linters: [revive]
+        text: "avoid meaningless package names"
+      - linters: [revive]
+        text: "avoid package names that conflict with Go standard library package names"
+      # Packages transferred verbatim from llm-d-kv-cache (#1862); style cleanup tracked separately
+      - path: pkg/(kvcache|kvevents)/
+        linters:
+          - revive
+          - perfsprint
+          - goconst
+          - dupword
+          - prealloc
+      # The panic ban applies only to pkg/epp/flowcontrol (non-test files); see that package's doc.go.
+      - path-except: pkg/epp/flowcontrol/
+        linters:
+          - forbidigo
+      - path: _test\.go$
+        linters:
+          - forbidigo
+  settings:
+    forbidigo:
+      forbid:
+        - pattern: ^panic$
+          msg: "pkg/epp/flowcontrol is panic-free by design (see its doc.go); validate at the boundary and return an error"
+    importas:
+      no-unaliased: false # unaliased imports are allowed; only enforce when an alias is used
+      alias:
+        - pkg: github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling
+          alias: fwksched
+        - pkg: github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol
+          alias: fwkrc
+        - pkg: github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol
+          alias: fwkfc
+        - pkg: github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol/mocks
+          alias: fwkfcmocks
+        - pkg: github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin
+          alias: fwkplugin
+        - pkg: github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix
+          alias: attrprefix
+        - pkg: github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/extractor/metrics
+          alias: extractormetrics
+        - pkg: github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/metrics
+          alias: sourcemetrics
+        - pkg: github.com/llm-d/llm-d-router/pkg/epp/util/pool
+          alias: poolutil
+        - pkg: github.com/llm-d/llm-d-router/pkg/epp/util/testing
+          alias: testutil
+        - pkg: github.com/llm-d/llm-d-router/pkg/common/error
+          alias: errcommon
+        - pkg: github.com/llm-d/llm-d-router/test/utils/igw
+          alias: igwtestutils
+        - pkg: github.com/llm-d/llm-d-router/test/framework/net
+          alias: fwknet
+        - pkg: github.com/llm-d/llm-d-router/test/framework/context
+          alias: fwkcontext
+        - pkg: github.com/llm-d/llm-d-router/test/framework/k8s
+          alias: fwkk8s
+        - pkg: github.com/llm-d/llm-d-router/test/framework/gaie
+          alias: fwkgaie
+        - pkg: github.com/llm-d/llm-d-router/test/framework/epp
+          alias: fwkepp
+    revive: # see https://github.com/mgechev/revive#available-rules for all options
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: errorf
+        - name: if-return
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: var-declaration
+        - name: var-naming
+
+issues:
+  # do not limit the number of issues, ensure even identical are reported
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  # Note: 'new' setting is controlled via Makefile LINT_NEW_ONLY variable
+  # Set to true to only check new code, false (default) to check all code

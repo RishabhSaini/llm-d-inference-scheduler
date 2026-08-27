@@ -1,0 +1,97 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package passthrough
+
+import (
+	"context"
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	v1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
+
+	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
+)
+
+func TestPassthroughParser_ParseRequest(t *testing.T) {
+	parser := NewPassthroughParser()
+	ctx := context.Background()
+
+	tests := []struct {
+		name     string
+		body     []byte
+		headers  map[string]string
+		wantBody *fwkrh.InferenceRequestBody
+	}{
+		{
+			name:    "empty body",
+			body:    []byte{},
+			headers: map[string]string{},
+			wantBody: &fwkrh.InferenceRequestBody{
+				Payload: fwkrh.RawPayload([]byte{}),
+			},
+		},
+		{
+			name:    "non-empty body",
+			body:    []byte("hello world"),
+			headers: map[string]string{},
+			wantBody: &fwkrh.InferenceRequestBody{
+				Payload: fwkrh.RawPayload([]byte("hello world")),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parser.ParseRequest(ctx, tt.body, tt.headers)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.SkipResponseProcessing != false {
+				t.Errorf("got.SkipResponseProcessing = %v, want false", got.SkipResponseProcessing)
+			}
+			if diff := cmp.Diff(tt.wantBody, got.Body); diff != "" {
+				t.Errorf("Unexpected body (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestPassthroughParser_ParseResponse(t *testing.T) {
+	parser := NewPassthroughParser()
+	ctx := context.Background()
+
+	got, err := parser.ParseResponse(ctx, []byte("hello"), map[string]string{}, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil result, got %v", got)
+	}
+}
+
+func TestPassthroughParser_Claims(t *testing.T) {
+	parser := NewPassthroughParser()
+	got := parser.Claims()
+	want := fwkrh.Claims{
+		Paths:     nil,
+		Protocols: []v1.AppProtocol{},
+	}
+
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("Claims() mismatch (-want +got):\n%s", diff)
+	}
+}

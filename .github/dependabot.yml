@@ -13,7 +13,12 @@ updates:
       - "dependencies"
       - "release-note-none"
     ignore:
+      # Major/minor upgrades are handled intentionally via `make upgrade-deps`; dependabot covers patches only
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      # GAIE is updated manually only (all versions)
       - dependency-name: "sigs.k8s.io/gateway-api-inference-extension"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
     groups:
       go-dependencies:
         patterns:
@@ -33,8 +38,13 @@ updates:
       - "release-note-none"
     commit-message:
       prefix: "deps(actions)"
+    # No "ignore" block here: This allows major version updates
+    groups:
+      github-actions:
+        patterns:
+          - "*"
 
-  # 3. Docker base image updates (e.g., for Dockerfile FROM lines)
+  # 3. Docker base image updates
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
@@ -43,3 +53,7 @@ updates:
       - "dependencies"
     commit-message:
       prefix: "deps(docker)"
+    ignore:
+      # dependabot covers patches only
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]

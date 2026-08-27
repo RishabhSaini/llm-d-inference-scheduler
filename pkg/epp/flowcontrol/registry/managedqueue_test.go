@@ -1,0 +1,437 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package registry
+
+import (
+	"errors"
+	"sync"
+	"testing"
+
+	"github.com/go-logr/logr"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts"
+	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts/mocks"
+	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/queue"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
+	fwkfcmocks "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol/mocks"
+)
+
+// --- Test Harness and Mocks ---
+
+// mqTestHarness holds all components for testing a `managedQueue`.
+type mqTestHarness struct {
+	t          *testing.T
+	mq         *managedQueue
+	mockPolicy *fwkfcmocks.MockOrderingPolicy
+
+	// bandStats and registryStats are the counters handed to the queue under test; the queue must apply
+	// identical deltas to both (see assertStatsDelta).
+	bandStats     occupancyStats
+	registryStats occupancyStats
+}
+
+// newMockedMqHarness creates a harness that uses a mocked underlying queue.
+// This is ideal for isolating and unit testing the decorator logic of `managedQueue`.
+func newMockedMqHarness(t *testing.T, queue *mocks.MockSafeQueue, key flowcontrol.FlowKey) *mqTestHarness {
+	t.Helper()
+	return newMqHarness(t, queue, key)
+}
+
+// newRealMqHarness creates a harness that uses a real "PriorityQueue" implementation.
+// This is essential for integration and concurrency tests.
+func newRealMqHarness(t *testing.T, key flowcontrol.FlowKey) *mqTestHarness {
+	t.Helper()
+	// The priority queue orders by the policy's comparator; order by enqueue time for FCFS-like behavior.
+	policy := &fwkfcmocks.MockOrderingPolicy{
+		LessFunc: func(a, b flowcontrol.QueueItemAccessor) bool {
+			return a.EnqueueTime().Before(b.EnqueueTime())
+		},
+	}
+	return newMqHarness(t, queue.New(policy), key)
+}
+
+// newMqHarness is the base constructor for the test harness.
+func newMqHarness(t *testing.T, queue contracts.SafeQueue, key flowcontrol.FlowKey) *mqTestHarness {
+	t.Helper()
+
+	h := &mqTestHarness{
+		t:          t,
+		mockPolicy: &fwkfcmocks.MockOrderingPolicy{},
+	}
+	h.mq = newManagedQueue(queue, h.mockPolicy, key, logr.Discard(), &h.bandStats, &h.registryStats, nil)
+	require.NotNil(t, h.mq, "Test setup: newManagedQueue must return a valid instance")
+	return h
+}
+
+// setupWithItems pre-populates the queue and resets the captured counters for focused testing.
+func (h *mqTestHarness) setupWithItems(items ...flowcontrol.QueueItemAccessor) {
+	h.t.Helper()
+	for _, item := range items {
+		err := h.mq.Add(item)
+		require.NoError(h.t, err, "Harness setup: failed to add initial item to the queue")
+	}
+	h.resetStats()
+}
+
+// assertStatsDelta asserts the accumulated deltas on both capture targets, which must mirror each other.
+func (h *mqTestHarness) assertStatsDelta(lenDelta, byteSizeDelta int64) {
+	h.t.Helper()
+	assert.Equal(h.t, lenDelta, h.bandStats.len.Load(), "Band length delta must match the queue mutation")
+	assert.Equal(h.t, byteSizeDelta, h.bandStats.byteSize.Load(), "Band byte size delta must match the queue mutation")
+	assert.Equal(h.t, lenDelta, h.registryStats.len.Load(), "Registry length delta must mirror the band delta")
+	assert.Equal(h.t, byteSizeDelta, h.registryStats.byteSize.Load(), "Registry byte size delta must mirror the band delta")
+}
+
+// resetStats zeroes the captured counters so assertions see only the deltas from the action under test.
+func (h *mqTestHarness) resetStats() {
+	h.bandStats.len.Store(0)
+	h.bandStats.byteSize.Store(0)
+	h.registryStats.len.Store(0)
+	h.registryStats.byteSize.Store(0)
+}
+
+// --- Unit Tests ---
+
+func TestManagedQueue_InitialState(t *testing.T) {
+	t.Parallel()
+	h := newMockedMqHarness(t, &mocks.MockSafeQueue{}, flowcontrol.FlowKey{ID: "flow", Priority: 1})
+	assert.Zero(t, h.mq.Len(), "A newly initialized queue must have a length of 0")
+	assert.Zero(t, h.mq.ByteSize(), "A newly initialized queue must have a byte size of 0")
+}
+
+func TestManagedQueue_Add(t *testing.T) {
+	t.Parallel()
+	flowKey := flowcontrol.FlowKey{ID: "flow", Priority: 1}
+
+	testCases := []struct {
+		name                  string
+		setupMock             func(q *mocks.MockSafeQueue)
+		expectErr             bool
+		expectErrIs           error // Optional
+		expectedLenDelta      int64
+		expectedByteSizeDelta int64
+	}{
+		{
+			name: "ShouldSucceed_AndPropagateMeasuredDelta",
+			setupMock: func(q *mocks.MockSafeQueue) {
+				q.AddFunc = func(flowcontrol.QueueItemAccessor) {
+					// Deltas are measured from queue-reported stats, so the mock reports the change.
+					q.LenV = 1
+					q.ByteSizeV = 100
+				}
+			},
+			expectErr:             false,
+			expectedLenDelta:      1,
+			expectedByteSizeDelta: 100,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			q := &mocks.MockSafeQueue{}
+			h := newMqHarness(t, q, flowKey)
+			item := fwkfcmocks.NewMockQueueItemAccessor(100, "req", flowKey)
+			if tc.setupMock != nil {
+				tc.setupMock(q)
+			}
+
+			err := h.mq.Add(item)
+
+			if tc.expectErr {
+				require.Error(t, err, "Add operation must fail when the underlying queue returns an error")
+				if tc.expectErrIs != nil {
+					assert.ErrorIs(t, err, tc.expectErrIs, "The returned error was not of the expected type")
+				}
+			} else {
+				require.NoError(t, err, "Add operation must succeed when the underlying queue accepts the item")
+			}
+			h.assertStatsDelta(tc.expectedLenDelta, tc.expectedByteSizeDelta)
+		})
+	}
+}
+
+func TestManagedQueue_Remove(t *testing.T) {
+	t.Parallel()
+	flowKey := flowcontrol.FlowKey{ID: "flow", Priority: 1}
+
+	testCases := []struct {
+		name                  string
+		setupMock             func(q *mocks.MockSafeQueue, item flowcontrol.QueueItemAccessor)
+		expectErr             bool
+		expectedLenDelta      int64
+		expectedByteSizeDelta int64
+	}{
+		{
+			name: "ShouldSucceed_AndPropagateMeasuredDelta",
+			setupMock: func(q *mocks.MockSafeQueue, item flowcontrol.QueueItemAccessor) {
+				// Deltas are measured from queue-reported stats: prime the pre-mutation state and
+				// have the mock report the post-mutation state.
+				q.LenV = 1
+				q.ByteSizeV = 100
+				q.RemoveFunc = func(_ flowcontrol.QueueItemHandle) (flowcontrol.QueueItemAccessor, error) {
+					q.LenV = 0
+					q.ByteSizeV = 0
+					return item, nil
+				}
+			},
+			expectErr:             false,
+			expectedLenDelta:      -1,
+			expectedByteSizeDelta: -100,
+		},
+		{
+			name: "ShouldFail_AndNotChangeStats_WhenUnderlyingQueueFails",
+			setupMock: func(q *mocks.MockSafeQueue, item flowcontrol.QueueItemAccessor) {
+				q.LenV = 1
+				q.ByteSizeV = 100
+				q.RemoveFunc = func(_ flowcontrol.QueueItemHandle) (flowcontrol.QueueItemAccessor, error) {
+					return nil, errors.New("remove failed")
+				}
+			},
+			expectErr:             true,
+			expectedLenDelta:      0,
+			expectedByteSizeDelta: 0,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			q := &mocks.MockSafeQueue{}
+			h := newMockedMqHarness(t, q, flowKey)
+			item := fwkfcmocks.NewMockQueueItemAccessor(100, "req", flowKey)
+			h.setupWithItems(item)
+			tc.setupMock(q, item)
+
+			_, err := h.mq.Remove(item.Handle())
+
+			if tc.expectErr {
+				require.Error(t, err,
+					"Remove operation must fail when the underlying queue returns an error (e.g., item not found)")
+			} else {
+				require.NoError(t, err, "Remove operation must succeed when the underlying queue successfully removes the item")
+			}
+			h.assertStatsDelta(tc.expectedLenDelta, tc.expectedByteSizeDelta)
+		})
+	}
+}
+
+func TestManagedQueue_Cleanup(t *testing.T) {
+	t.Parallel()
+	flowKey := flowcontrol.FlowKey{ID: "flow", Priority: 1}
+
+	testCases := []struct {
+		name                  string
+		setupMock             func(q *mocks.MockSafeQueue, items []flowcontrol.QueueItemAccessor)
+		expectedLenDelta      int64
+		expectedByteSizeDelta int64
+	}{
+		{
+			name: "ShouldSucceed_AndPropagateMeasuredDelta_WhenItemsRemoved",
+			setupMock: func(q *mocks.MockSafeQueue, items []flowcontrol.QueueItemAccessor) {
+				q.LenV = 2
+				q.ByteSizeV = 125
+				q.CleanupFunc = func(_ contracts.PredicateFunc) []flowcontrol.QueueItemAccessor {
+					q.LenV = 0
+					q.ByteSizeV = 0
+					return items
+				}
+			},
+			expectedLenDelta:      -2,
+			expectedByteSizeDelta: -125,
+		},
+		{
+			name: "ShouldSucceed_AndNotChangeStats_WhenNoItemsRemoved",
+			setupMock: func(q *mocks.MockSafeQueue, items []flowcontrol.QueueItemAccessor) {
+				q.LenV = 2
+				q.ByteSizeV = 125
+				q.CleanupFunc = func(_ contracts.PredicateFunc) []flowcontrol.QueueItemAccessor {
+					return nil // Simulate no items matching predicate.
+				}
+			},
+			expectedLenDelta:      0,
+			expectedByteSizeDelta: 0,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			q := &mocks.MockSafeQueue{}
+			h := newMockedMqHarness(t, q, flowKey)
+			items := []flowcontrol.QueueItemAccessor{
+				fwkfcmocks.NewMockQueueItemAccessor(50, "req", flowKey),
+				fwkfcmocks.NewMockQueueItemAccessor(75, "req", flowKey),
+			}
+			h.setupWithItems(items...)
+			tc.setupMock(q, items)
+			h.mq.Cleanup(func(_ flowcontrol.QueueItemAccessor) bool { return true })
+			h.assertStatsDelta(tc.expectedLenDelta, tc.expectedByteSizeDelta)
+		})
+	}
+}
+
+func TestManagedQueue_Drain(t *testing.T) {
+	t.Parallel()
+	flowKey := flowcontrol.FlowKey{ID: "flow", Priority: 1}
+
+	testCases := []struct {
+		name                  string
+		setupMock             func(q *mocks.MockSafeQueue, items []flowcontrol.QueueItemAccessor)
+		expectedLenDelta      int64
+		expectedByteSizeDelta int64
+	}{
+		{
+			name: "ShouldSucceed_AndPropagateMeasuredDelta",
+			setupMock: func(q *mocks.MockSafeQueue, items []flowcontrol.QueueItemAccessor) {
+				q.LenV = 2
+				q.ByteSizeV = 125
+				q.DrainFunc = func() []flowcontrol.QueueItemAccessor {
+					q.LenV = 0
+					q.ByteSizeV = 0
+					return items
+				}
+			},
+			expectedLenDelta:      -2,
+			expectedByteSizeDelta: -125,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			q := &mocks.MockSafeQueue{}
+			h := newMockedMqHarness(t, q, flowKey)
+			items := []flowcontrol.QueueItemAccessor{
+				fwkfcmocks.NewMockQueueItemAccessor(50, "req", flowKey),
+				fwkfcmocks.NewMockQueueItemAccessor(75, "req", flowKey),
+			}
+			h.setupWithItems(items...)
+			tc.setupMock(q, items)
+
+			h.mq.Drain()
+			h.assertStatsDelta(tc.expectedLenDelta, tc.expectedByteSizeDelta)
+		})
+	}
+}
+
+func TestManagedQueue_FlowQueueAccessor(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ProxiesCalls", func(t *testing.T) {
+		t.Parallel()
+		flowKey := flowcontrol.FlowKey{ID: "flow", Priority: 1}
+		q := &mocks.MockSafeQueue{}
+		harness := newMockedMqHarness(t, q, flowKey)
+		item := fwkfcmocks.NewMockQueueItemAccessor(100, "req-1", flowKey)
+		q.PeekV = item
+		require.NoError(t, harness.mq.Add(item), "Test setup: Adding an item must succeed")
+
+		accessor := harness.mq.FlowQueueAccessor()
+		require.NotNil(t, accessor, "FlowQueueAccessor must return a non-nil instance (guaranteed by contract)")
+
+		assert.Equal(t, harness.mq.Len(), accessor.Len(), "Accessor Len() must reflect the managed queue's current length")
+		assert.Equal(t, harness.mq.ByteSize(), accessor.ByteSize(),
+			"Accessor ByteSize() must reflect the managed queue's current byte size")
+		assert.Equal(t, flowKey, accessor.FlowKey(), "Accessor FlowKey() must return the correct identifier for the flow")
+		assert.Equal(t, harness.mockPolicy, accessor.OrderingPolicy(),
+			"Accessor OrderingPolicy() must return the policy provided by the configured ordering policy")
+
+		peekedHead := accessor.Peek()
+		assert.Same(t, item, peekedHead, "Accessor Peek() must return the exact item instance at the head")
+	})
+
+	t.Run("EmptyQueue", func(t *testing.T) {
+		t.Parallel()
+		flowKey := flowcontrol.FlowKey{ID: "flow", Priority: 1}
+		q := &mocks.MockSafeQueue{}
+		q.PeekV = nil
+		harness := newMockedMqHarness(t, q, flowKey)
+		accessor := harness.mq.FlowQueueAccessor()
+		assert.Nil(t, accessor.Peek(), "Accessor Peek() should return an nil on an empty queue")
+	})
+}
+
+// --- Concurrency Test ---
+
+// TestManagedQueue_Concurrency_StatsIntegrity validates that under high contention, the final propagated statistics
+// are consistent. It spins up multiple goroutines that concurrently and rapidly add and remove items to stress-test
+// the mutex protecting write operations and the atomic propagation of statistics.
+func TestManagedQueue_Concurrency_StatsIntegrity(t *testing.T) {
+	t.Parallel()
+	const (
+		numWorkers   = 10
+		opsPerWorker = 500
+		itemByteSize = 10
+	)
+
+	flowKey := flowcontrol.FlowKey{ID: "flow", Priority: 1}
+	h := newRealMqHarness(t, flowKey)
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+
+	for range numWorkers {
+		go func() {
+			defer wg.Done()
+			for range opsPerWorker {
+				item := fwkfcmocks.NewMockQueueItemAccessor(uint64(itemByteSize), "req", flowKey)
+				require.NoError(t, h.mq.Add(item), "Concurrent Add operation must succeed without errors or races")
+				// In this chaos test, `Remove` may fail if another goroutine removes the item first. This is expected.
+				_, _ = h.mq.Remove(item.Handle())
+			}
+		}()
+	}
+	wg.Wait()
+
+	// After all operations, the queue should ideally be empty, but we drain any remaining items to get a definitive final
+	// state.
+	h.mq.Drain()
+	assert.Zero(t, h.mq.Len(), "Final queue length must be zero after draining all remaining items")
+	assert.Zero(t, h.mq.ByteSize(), "Final queue byte size must be zero after draining all remaining items")
+	h.assertStatsDelta(int64(0), int64(0))
+}
+
+// --- Structural Invariant Test ---
+
+// TestManagedQueue_MeasuredDeltas_CannotUnderflow verifies the structural non-negativity property:
+// because aggregate deltas are measured from queue-reported stats rather than derived from returned
+// items, a queue that hands back the same item repeatedly (without its stats changing) produces no
+// delta at all. There is no independent counter to underflow and nothing to panic about.
+func TestManagedQueue_MeasuredDeltas_CannotUnderflow(t *testing.T) {
+	t.Parallel()
+	flowKey := flowcontrol.FlowKey{ID: "flow", Priority: 1}
+	item := fwkfcmocks.NewMockQueueItemAccessor(100, "req", flowKey)
+	q := &mocks.MockSafeQueue{}
+	q.AddFunc = func(flowcontrol.QueueItemAccessor) {}
+	q.RemoveFunc = func(flowcontrol.QueueItemHandle) (flowcontrol.QueueItemAccessor, error) {
+		// Logically inconsistent mock: always "succeeds" but never changes its reported stats.
+		return item, nil
+	}
+	h := newMockedMqHarness(t, q, flowKey)
+
+	require.NoError(t, h.mq.Add(item), "Test setup: Initial Add must succeed")
+	h.resetStats()
+
+	for range 3 {
+		_, err := h.mq.Remove(item.Handle())
+		require.NoError(t, err, "Remove against the misreporting mock should surface no error")
+	}
+
+	h.assertStatsDelta(int64(0), int64(0))
+}

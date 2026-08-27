@@ -17,24 +17,42 @@ limitations under the License.
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
-	"time"
 
-	"github.com/llm-d/llm-d-inference-scheduler/pkg/common"
-	"github.com/llm-d/llm-d-inference-scheduler/test/sidecar/mock"
 	. "github.com/onsi/ginkgo/v2" // nolint:revive
 	. "github.com/onsi/gomega"    // nolint:revive
-	"k8s.io/klog/v2/ktesting"
+
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
+	"github.com/llm-d/llm-d-router/test/sidecar/mock"
 )
+
+const chatCompletionsRequestBody = `{
+				"model": "Qwen/Qwen2-0.5B",
+				"messages": [
+				  {"role": "user", "content": "Hello"}
+				],
+				"max_tokens": 50
+			}`
+
+const chatCompletionsRequestBodyWithMaxCompletionTokens = `{
+				"model": "Qwen/Qwen2-0.5B",
+				"messages": [
+				  {"role": "user", "content": "Hello"}
+				],
+				"max_tokens": 50,
+				"max_completion_tokens": 100
+			}`
 
 type sidecarTestInfo struct {
 	ctx            context.Context
+	cancelFn       context.CancelFunc
+	stoppedCh      chan struct{}
 	decodeBackend  *httptest.Server
 	decodeHandler  *mock.ChatCompletionHandler
 	prefillBackend *httptest.Server
@@ -43,7 +61,26 @@ type sidecarTestInfo struct {
 	proxy          *Server
 }
 
-var connectors = []string{ConnectorLMCache, ConnectorNIXLV2}
+// startProxy launches the proxy in a goroutine, waits for it to be ready, and
+// returns its base address. Pair with testInfo.cancelFn() / <-testInfo.stoppedCh
+// for teardown.
+func (testInfo *sidecarTestInfo) startProxy() string {
+	go func() {
+		defer GinkgoRecover()
+
+		testInfo.proxy.allowlistValidator = &AllowlistValidator{enabled: false}
+		err := testInfo.proxy.Start(testInfo.ctx)
+		Expect(err).ToNot(HaveOccurred())
+
+		testInfo.stoppedCh <- struct{}{}
+	}()
+
+	<-testInfo.proxy.readyCh
+	return "http://" + testInfo.proxy.addr.String()
+}
+
+// SGLang and Mooncake excluded: async prefill requires Eventually and bootstrap server setup.
+var connectors = []string{KVConnectorSharedStorage, KVConnectorNIXLV2}
 
 var _ = Describe("Common Connector tests", func() {
 
@@ -57,35 +94,28 @@ var _ = Describe("Common Connector tests", func() {
 				go func() {
 					defer GinkgoRecover()
 
-					validator := &AllowlistValidator{enabled: false}
-					err := testInfo.proxy.Start(testInfo.ctx, nil, validator)
+					testInfo.proxy.allowlistValidator = &AllowlistValidator{enabled: false}
+					err := testInfo.proxy.Start(testInfo.ctx)
 					Expect(err).ToNot(HaveOccurred())
+
+					testInfo.stoppedCh <- struct{}{}
 				}()
 
-				time.Sleep(1 * time.Second)
-				Expect(testInfo.proxy.addr).ToNot(BeNil())
+				<-testInfo.proxy.readyCh
 				proxyBaseAddr := "http://" + testInfo.proxy.addr.String()
 
 				By("sending a /v1/chat/completions request with max_completion_tokens set")
-				//nolint:goconst
-				body := `{
-				"model": "Qwen/Qwen2-0.5B",
-				"messages": [
-				  {"role": "user", "content": "Hello"}
-				],
-				"max_tokens": 50,
-				"max_completion_tokens": 100
-			}`
+				body := chatCompletionsRequestBodyWithMaxCompletionTokens
 
-				req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, strings.NewReader(body))
+				req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, bytes.NewReader([]byte(body)))
 				Expect(err).ToNot(HaveOccurred())
-				req.Header.Add(common.PrefillPodHeader, testInfo.prefillBackend.URL[len("http://"):])
+				req.Header.Add(routing.PrefillEndpointHeader, testInfo.prefillBackend.URL[len("http://"):])
 
 				rp, err := http.DefaultClient.Do(req)
 				Expect(err).ToNot(HaveOccurred())
 
 				if rp.StatusCode != 200 {
-					bp, _ := io.ReadAll(rp.Body) //nolint:all
+					bp, _ := io.ReadAll(rp.Body) //nolint:errcheck
 					Fail(string(bp))
 				}
 
@@ -104,6 +134,9 @@ var _ = Describe("Common Connector tests", func() {
 
 				// The decode request should have the original max_completion_tokens value
 				Expect(decodeReq).To(HaveKeyWithValue("max_completion_tokens", BeNumerically("==", 100)))
+
+				testInfo.cancelFn()
+				<-testInfo.stoppedCh
 			})
 
 			// Regression test for commit bb181d6: Ensure max_completion_tokens is handled when not provided
@@ -114,13 +147,14 @@ var _ = Describe("Common Connector tests", func() {
 				go func() {
 					defer GinkgoRecover()
 
-					validator := &AllowlistValidator{enabled: false}
-					err := testInfo.proxy.Start(testInfo.ctx, nil, validator)
+					testInfo.proxy.allowlistValidator = &AllowlistValidator{enabled: false}
+					err := testInfo.proxy.Start(testInfo.ctx)
 					Expect(err).ToNot(HaveOccurred())
+
+					testInfo.stoppedCh <- struct{}{}
 				}()
 
-				time.Sleep(1 * time.Second)
-				Expect(testInfo.proxy.addr).ToNot(BeNil())
+				<-testInfo.proxy.readyCh
 				proxyBaseAddr := "http://" + testInfo.proxy.addr.String()
 
 				By("sending a /v1/chat/completions request without max_completion_tokens")
@@ -133,15 +167,15 @@ var _ = Describe("Common Connector tests", func() {
 				    "max_tokens": 50
 			    }`
 
-				req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, strings.NewReader(body))
+				req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, bytes.NewReader([]byte(body)))
 				Expect(err).ToNot(HaveOccurred())
-				req.Header.Add(common.PrefillPodHeader, testInfo.prefillBackend.URL[len("http://"):])
+				req.Header.Add(routing.PrefillEndpointHeader, testInfo.prefillBackend.URL[len("http://"):])
 
 				rp, err := http.DefaultClient.Do(req)
 				Expect(err).ToNot(HaveOccurred())
 
 				if rp.StatusCode != 200 {
-					bp, _ := io.ReadAll(rp.Body) //nolint:all
+					bp, _ := io.ReadAll(rp.Body) //nolint:errcheck
 					Fail(string(bp))
 				}
 
@@ -160,6 +194,9 @@ var _ = Describe("Common Connector tests", func() {
 
 				// The decode request should not have max_completion_tokens if it wasn't in the original request
 				Expect(decodeReq).ToNot(HaveKey("max_completion_tokens"))
+
+				testInfo.cancelFn()
+				<-testInfo.stoppedCh
 			})
 		})
 	}
@@ -168,7 +205,9 @@ var _ = Describe("Common Connector tests", func() {
 func sidecarConnectionTestSetup(connector string) *sidecarTestInfo {
 	testInfo := sidecarTestInfo{}
 
-	_, testInfo.ctx = ktesting.NewTestContext(GinkgoT())
+	testInfo.ctx = newTestContext()
+	testInfo.ctx, testInfo.cancelFn = context.WithCancel(testInfo.ctx)
+	testInfo.stoppedCh = make(chan struct{})
 
 	// Decoder
 	testInfo.decodeHandler = &mock.ChatCompletionHandler{
@@ -190,8 +229,8 @@ func sidecarConnectionTestSetup(connector string) *sidecarTestInfo {
 	url, err := url.Parse(testInfo.decodeBackend.URL)
 	Expect(err).ToNot(HaveOccurred())
 	testInfo.decodeURL = url
-	cfg := Config{Connector: connector}
-	testInfo.proxy = NewProxy("0", testInfo.decodeURL, cfg) // port 0 to automatically choose one that's available.
+	cfg := Config{Port: "0", DecoderURL: testInfo.decodeURL, KVConnector: connector}
+	testInfo.proxy = NewProxy(cfg)
 
 	return &testInfo
 }

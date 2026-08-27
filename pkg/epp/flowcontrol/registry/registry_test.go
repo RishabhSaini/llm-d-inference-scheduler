@@ -1,0 +1,1389 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package registry
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/go-logr/logr"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	testclock "k8s.io/utils/clock/testing"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol/mocks"
+	eppmetrics "github.com/llm-d/llm-d-router/pkg/epp/metrics"
+)
+
+// --- Test Harness ---
+
+// registryTestHarness provides a fully initialized test harness for the `FlowRegistry`.
+type registryTestHarness struct {
+	t         *testing.T
+	fr        *FlowRegistry
+	config    Config
+	fakeClock *testclock.FakeClock
+}
+
+// harnessOptions configures the test harness.
+type harnessOptions struct {
+	config   *Config
+	manualGC bool
+}
+
+// newRegistryTestHarness creates and starts a new `FlowRegistry` for testing.
+func newRegistryTestHarness(t *testing.T, opts harnessOptions) *registryTestHarness {
+	t.Helper()
+
+	var cfg *Config
+	var err error
+
+	if opts.config != nil {
+		cfg = opts.config.Clone()
+	} else {
+		cfg, err = NewConfig(
+			newTestPriorityBandPolicyDefaults(),
+			WithFlowGCTimeout(5*time.Minute),
+			WithPriorityBand(&PriorityBandConfig{Priority: highPriority}),
+			WithPriorityBand(&PriorityBandConfig{Priority: lowPriority}),
+		)
+		require.NoError(t, err, "Test setup: failed to create default config")
+	}
+
+	fakeClock := testclock.NewFakeClock(time.Now())
+	registryOpts := []RegistryOption{withClock(fakeClock)}
+	fr := NewFlowRegistry(cfg, logr.Discard(), registryOpts...)
+
+	if !opts.manualGC {
+		ctx, cancel := context.WithCancel(context.Background())
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			fr.RunMaintenanceLoop(ctx)
+		})
+		t.Cleanup(func() {
+			cancel()
+			wg.Wait()
+		})
+	}
+
+	return &registryTestHarness{
+		t:         t,
+		fr:        fr,
+		config:    *fr.config,
+		fakeClock: fakeClock,
+	}
+}
+
+// assertFlowExists synchronously checks if a flow's queue exists.
+func (h *registryTestHarness) assertFlowExists(key flowcontrol.FlowKey, msgAndArgs ...any) {
+	h.t.Helper()
+	_, err := h.fr.ManagedQueue(key)
+	assert.NoError(h.t, err, msgAndArgs...)
+}
+
+// assertFlowDoesNotExist synchronously checks if a flow's queue does not exist.
+func (h *registryTestHarness) assertFlowDoesNotExist(key flowcontrol.FlowKey, msgAndArgs ...any) {
+	h.t.Helper()
+	_, err := h.fr.ManagedQueue(key)
+	require.Error(h.t, err, "Expected an error when getting a non-existent flow, but got none")
+	assert.ErrorIs(h.t, err, contracts.ErrFlowInstanceNotFound, msgAndArgs...)
+}
+
+// openConnectionOnFlow ensures a flow is registered for the provided `key`.
+func (h *registryTestHarness) openConnectionOnFlow(key flowcontrol.FlowKey) {
+	h.t.Helper()
+	h.fr.mu.RLock()
+	_, exists := h.fr.config.PriorityBands[key.Priority]
+	h.fr.mu.RUnlock()
+	if !exists {
+		// Provision the band without asserting it into the desired set, so GC tests exercise
+		// collection of idle, undesired bands. Tests that need a band protected from GC mark it
+		// desired explicitly via ApplyDesiredPriorities.
+		require.NoError(h.t, h.fr.ensurePriorityBand(key.Priority), "Provisioning band for flow %s should not fail", key)
+	}
+	err := h.fr.WithConnection(key, func(conn contracts.ActiveFlowConnection) error { return nil })
+	require.NoError(h.t, err, "Registering flow %s should not fail", key)
+	h.assertFlowExists(key, "Flow %s should exist after registration", key)
+}
+
+// --- `FlowRegistryClient` API Tests ---
+
+func TestFlowRegistry_WithConnection_AndHandle(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ShouldJITRegisterFlow_OnFirstConnection", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+		key := flowcontrol.FlowKey{ID: "jit-flow", Priority: highPriority}
+
+		h.assertFlowDoesNotExist(key, "Flow should not exist before the first connection")
+
+		err := h.fr.WithConnection(key, func(conn contracts.ActiveFlowConnection) error {
+			h.assertFlowExists(key, "Flow should exist immediately after JIT registration within the connection")
+			require.NotNil(t, conn, "Connection handle provided to callback must not be nil")
+			return nil
+		})
+
+		require.NoError(t, err, "WithConnection should succeed for a new flow")
+		h.assertFlowExists(key, "Flow should remain in the registry after the connection is closed")
+	})
+
+	t.Run("ShouldFail_WhenFlowIDIsEmpty", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+		key := flowcontrol.FlowKey{ID: "", Priority: highPriority} // Invalid key
+
+		err := h.fr.WithConnection(key, func(conn contracts.ActiveFlowConnection) error {
+			t.Fatal("Callback must not be executed when the provided flow key is invalid")
+			return nil
+		})
+
+		require.Error(t, err, "WithConnection must return an error for an empty flow ID")
+		assert.ErrorIs(t, err, contracts.ErrFlowIDEmpty, "The returned error must be of the correct type")
+	})
+
+	t.Run("ShouldFail_WhenJITFails", func(t *testing.T) {
+		t.Parallel()
+
+		h := newRegistryTestHarness(t, harnessOptions{})
+		// Priority 999 has no configured band, so flow provisioning fails at JIT registration.
+		key := flowcontrol.FlowKey{ID: "test-flow", Priority: 999}
+
+		err := h.fr.WithConnection(key, func(conn contracts.ActiveFlowConnection) error {
+			t.Fatal("Callback must not be executed when the flow fails to register JIT")
+			return nil
+		})
+
+		require.Error(t, err, "WithConnection must return an error for a failed flow JIT registration")
+		assert.ErrorIs(t, err, contracts.ErrPriorityBandNotFound, "The returned error must propagate the reason")
+	})
+
+	t.Run("Handle_GetDataPlane_ShouldReturnNonNil", func(t *testing.T) {
+		t.Parallel()
+		// Create a registry
+		h := newRegistryTestHarness(t, harnessOptions{})
+
+		key := flowcontrol.FlowKey{ID: "test-flow", Priority: highPriority}
+
+		err := h.fr.WithConnection(key, func(conn contracts.ActiveFlowConnection) error {
+			dataPlane := conn.GetDataPlane()
+
+			assert.NotNil(t, dataPlane, "GetDataPlane() must never return nil")
+
+			return nil
+		})
+		require.NoError(t, err)
+	})
+}
+
+// --- `FlowRegistryAdmin` API Tests ---
+
+func TestFlowRegistry_Stats(t *testing.T) {
+	t.Parallel()
+
+	h := newRegistryTestHarness(t, harnessOptions{})
+	keyHigh := flowcontrol.FlowKey{ID: "high-pri-flow", Priority: highPriority}
+	keyLow := flowcontrol.FlowKey{ID: "low-pri-flow", Priority: lowPriority}
+	h.openConnectionOnFlow(keyHigh)
+	h.openConnectionOnFlow(keyLow)
+
+	mqHigh, _ := h.fr.ManagedQueue(keyHigh)
+	mqLow, _ := h.fr.ManagedQueue(keyLow)
+	require.NoError(t, mqHigh.Add(mocks.NewMockQueueItemAccessor(10, "req1", keyHigh)),
+		"Adding item to queue should not fail")
+	require.NoError(t, mqLow.Add(mocks.NewMockQueueItemAccessor(30, "req3", keyLow)),
+		"Adding item to queue should not fail")
+
+	// Although the production `Stats()` method provides a 'fuzzy snapshot' under high contention, our test validates it
+	// in a quiescent state, so these assertions can and must be exact.
+	globalStats := h.fr.Stats()
+	assert.Equal(t, uint64(2), globalStats.Global.Len, "Global TotalLen should be the sum of all items")
+	assert.Equal(t, uint64(40), globalStats.Global.ByteSize, "Global TotalByteSize should be the sum of all item sizes")
+
+	// Verify per-band stats are correctly propagated, not just global totals.
+	highBandStats, ok := globalStats.PerPriorityBand[highPriority]
+	require.True(t, ok, "PerPriorityBand should contain the high-priority band")
+	assert.Equal(t, uint64(1), highBandStats.Len,
+		"High-priority band should track 1 item")
+	assert.Equal(t, uint64(10), highBandStats.ByteSize,
+		"High-priority band should track 10 bytes")
+
+	lowBandStats, ok := globalStats.PerPriorityBand[lowPriority]
+	require.True(t, ok, "PerPriorityBand should contain the low-priority band")
+	assert.Equal(t, uint64(1), lowBandStats.Len,
+		"Low-priority band should track 1 item")
+	assert.Equal(t, uint64(30), lowBandStats.ByteSize,
+		"Low-priority band should track 30 bytes")
+
+}
+
+// --- Garbage Collection Tests ---
+
+func TestFlowRegistry_GarbageCollection(t *testing.T) {
+	t.Run("ShouldCollectIdleFlow", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{manualGC: true})
+		key := flowcontrol.FlowKey{ID: "idle-flow", Priority: highPriority}
+
+		h.openConnectionOnFlow(key)                            // Create a flow, which is born Idle.
+		h.fakeClock.Step(h.config.FlowGCTimeout + time.Second) // Advance the clock just past the GC timeout.
+		h.fr.ExecuteGCCycle()                                  // Manually and deterministically trigger a GC cycle.
+
+		h.assertFlowDoesNotExist(key, "Idle flow should be collected by the GC")
+	})
+
+	t.Run("ShouldNotCollectActiveFlow", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+		key := flowcontrol.FlowKey{ID: "active-flow", Priority: highPriority}
+
+		var wg sync.WaitGroup
+		leaseAcquired := make(chan struct{})
+		releaseLease := make(chan struct{})
+
+		wg.Go(func() {
+			// This goroutine holds the lease. It will not exit until the main test goroutine calls `wg.Done()`.
+			err := h.fr.WithConnection(key, func(contracts.ActiveFlowConnection) error {
+				close(leaseAcquired) // Signal to the main test that the lease is now active.
+				<-releaseLease       // Block here, holding the lease, until signaled.
+
+				return nil
+			})
+			require.NoError(t, err, "WithConnection in the background goroutine should not fail")
+		})
+		t.Cleanup(func() {
+			close(releaseLease) // Unblock the goroutine.
+			wg.Wait()           // Wait for the goroutine to fully exit.
+		})
+
+		<-leaseAcquired                              // Wait until the goroutine confirms that it has acquired the lease.
+		h.fakeClock.Step(h.config.FlowGCTimeout * 2) // Advance the clock well past the GC timeout.
+		h.fr.ExecuteGCCycle()                        // Manually and deterministically trigger a GC cycle.
+
+		h.assertFlowExists(key, "An active flow must not be garbage collected, even after a forced GC cycle")
+	})
+
+	t.Run("ShouldResetGCTimer_WhenFlowBecomesActive", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+		key := flowcontrol.FlowKey{ID: "reactivated-flow", Priority: highPriority}
+		h.openConnectionOnFlow(key)                            // Create an flow with a new idleness timer.
+		h.fakeClock.Step(h.config.FlowGCTimeout - time.Second) // Advance the clock to just before the GC timeout.
+		h.openConnectionOnFlow(key)                            // Open a new connection, resetting its idleness timer.
+		h.fakeClock.Step(2 * time.Second)                      // Advance the clock again.
+		h.fr.ExecuteGCCycle()                                  // Manually and deterministically trigger a GC cycle.
+
+		h.assertFlowExists(key, "Flow should survive GC because its idleness timer was reset")
+	})
+
+	t.Run("ShouldSkipGC_WhenIdleTimeoutExpired_ButActiveLeaseExists", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+		key := flowcontrol.FlowKey{ID: "race-resurrected-flow", Priority: highPriority}
+		h.openConnectionOnFlow(key)
+
+		// Manually manipulate the state to simulate a race condition.
+		// The flow is "Technically Idle" (timeout expired) ...
+		val, ok := h.fr.flowStates.Load(key)
+		require.True(t, ok)
+		state := val.(*flowState)
+
+		// Force the idle timestamp to be old.
+		oldTime := h.fakeClock.Now().Add(-h.config.FlowGCTimeout * 2)
+
+		state.mu.Lock()
+		state.becameIdleAt = oldTime
+
+		// ... BUT it has an active lease (simulating a request arriving just now).
+		// Note: In the real code, these two updates happen atomically, but we force this
+		// state to verify the GC's safety priority (Lease > Time).
+		state.leaseCount = 1
+		state.mu.Unlock()
+
+		// Trigger GC.
+		h.fr.ExecuteGCCycle()
+
+		// The GC should have seen the leaseCount > 0 and skipped the deletion, despite the expired timestamp.
+		h.assertFlowExists(key, "Flow must not be collected if lease > 0, even if idle timer is expired")
+	})
+}
+
+// --- Dynamic Provisioning Tests ---
+
+func TestFlowRegistry_DynamicProvisioning(t *testing.T) {
+	t.Parallel()
+
+	t.Run("SubmitDesiredPriorities_DoesNotBlockWithoutProcessor", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{manualGC: true})
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for i := range 100 {
+				h.fr.SubmitDesiredPriorities(map[int]struct{}{i: {}})
+			}
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("SubmitDesiredPriorities blocked without a processor consumer")
+		}
+	})
+
+	t.Run("ShouldRejectUnknownPriority_WhenBandNotProvisioned", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+		key := flowcontrol.FlowKey{ID: "unprovisioned-flow", Priority: 55}
+
+		err := h.fr.WithConnection(key, func(conn contracts.ActiveFlowConnection) error {
+			return nil
+		})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, contracts.ErrPriorityBandNotFound)
+	})
+
+	t.Run("ShouldCreateBand_WhenPriorityIsUnknown", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+		dynamicPrio := 55
+		key := flowcontrol.FlowKey{ID: "dynamic-flow", Priority: dynamicPrio}
+
+		h.fr.ApplyDesiredPriorities(map[int]struct{}{dynamicPrio: {}})
+
+		err := h.fr.WithConnection(key, func(conn contracts.ActiveFlowConnection) error {
+			return nil
+		})
+		require.NoError(t, err, "WithConnection should succeed after control-plane provisioning")
+
+		h.fr.mu.RLock()
+		_, existsInConfig := h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		assert.True(t, existsInConfig, "Dynamic priority must be added to global config definition")
+
+		stats := h.fr.Stats()
+		_, existsInStats := stats.PerPriorityBand[dynamicPrio]
+		assert.True(t, existsInStats, "Dynamic priority must appear in global stats")
+
+		_, err = h.fr.ManagedQueue(key)
+		assert.NoError(t, err, "Dynamic band must be provisioned")
+	})
+
+	t.Run("ShouldHandleConcurrentDynamicCreation", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+		dynamicPrio := 77
+		key := flowcontrol.FlowKey{ID: "race-flow", Priority: dynamicPrio}
+
+		h.fr.ApplyDesiredPriorities(map[int]struct{}{dynamicPrio: {}})
+
+		var wg sync.WaitGroup
+		concurrency := 10
+		wg.Add(concurrency)
+
+		for range concurrency {
+			go func() {
+				defer wg.Done()
+				_ = h.fr.WithConnection(key, func(conn contracts.ActiveFlowConnection) error { return nil })
+			}()
+		}
+		wg.Wait()
+
+		h.fr.mu.RLock()
+		_, exists := h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		assert.True(t, exists, "Band should exist after concurrent creation attempts")
+	})
+
+	t.Run("ShouldPersistDynamicBands", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+		dynamicPrio := 88
+		key := flowcontrol.FlowKey{ID: "scaling-flow", Priority: dynamicPrio}
+
+		h.fr.ApplyDesiredPriorities(map[int]struct{}{dynamicPrio: {}})
+		h.openConnectionOnFlow(key)
+
+		_, policyErr := h.fr.FairnessPolicy(dynamicPrio)
+		assert.NoError(t, policyErr, "The dynamic priority band must have been configured")
+
+		mq, err := h.fr.ManagedQueue(key)
+		require.NoError(t, err, "Existing flows should be auto-synced")
+		require.NotNil(t, mq)
+	})
+
+	t.Run("ShouldUseNegativeBandTemplate_WhenPriorityBelowZero", func(t *testing.T) {
+		t.Parallel()
+		defaults := newTestPriorityBandPolicyDefaults()
+
+		negativeMaxBytes := uint64(256)
+		cfg, err := NewConfig(defaults,
+			WithDefaultNegativePriorityBand(&PriorityBandConfig{
+				MaxBytes: negativeMaxBytes,
+			}),
+		)
+		require.NoError(t, err)
+
+		h := newRegistryTestHarness(t, harnessOptions{config: cfg})
+
+		negativePrio := -5
+		key := flowcontrol.FlowKey{ID: "negative-flow", Priority: negativePrio}
+
+		h.fr.ApplyDesiredPriorities(map[int]struct{}{negativePrio: {}})
+		err = h.fr.WithConnection(key, func(conn contracts.ActiveFlowConnection) error {
+			return nil
+		})
+		require.NoError(t, err, "WithConnection should succeed for negative priority")
+
+		h.fr.mu.RLock()
+		band, exists := h.fr.config.PriorityBands[negativePrio]
+		h.fr.mu.RUnlock()
+		require.True(t, exists, "Negative priority band should be dynamically provisioned")
+		assert.Equal(t, negativeMaxBytes, band.MaxBytes,
+			"Negative priority band should use DefaultNegativePriorityBand template")
+	})
+
+	t.Run("ShouldFallBackToDefaultBand_WhenNegativeTemplateIsNil", func(t *testing.T) {
+		t.Parallel()
+		defaults := newTestPriorityBandPolicyDefaults()
+
+		cfg, err := NewConfig(defaults)
+		require.NoError(t, err)
+
+		h := newRegistryTestHarness(t, harnessOptions{config: cfg})
+
+		negativePrio := -3
+		key := flowcontrol.FlowKey{ID: "fallback-flow", Priority: negativePrio}
+
+		h.fr.ApplyDesiredPriorities(map[int]struct{}{negativePrio: {}})
+		err = h.fr.WithConnection(key, func(conn contracts.ActiveFlowConnection) error {
+			return nil
+		})
+		require.NoError(t, err)
+
+		h.fr.mu.RLock()
+		band, exists := h.fr.config.PriorityBands[negativePrio]
+		h.fr.mu.RUnlock()
+		require.True(t, exists, "Negative priority band should still be provisioned")
+		assert.Equal(t, defaultPriorityBandMaxBytes, band.MaxBytes,
+			"Without negative template, should fall back to default band's MaxBytes")
+	})
+
+	t.Run("ShouldUseDefaultBand_WhenPositivePriorityWithNegativeTemplate", func(t *testing.T) {
+		t.Parallel()
+		defaults := newTestPriorityBandPolicyDefaults()
+
+		negativeMaxBytes := uint64(100)
+		cfg, err := NewConfig(defaults,
+			WithDefaultNegativePriorityBand(&PriorityBandConfig{
+				MaxBytes: negativeMaxBytes,
+			}),
+		)
+		require.NoError(t, err)
+
+		h := newRegistryTestHarness(t, harnessOptions{config: cfg})
+
+		positivePrio := 42
+		key := flowcontrol.FlowKey{ID: "positive-flow", Priority: positivePrio}
+
+		h.fr.ApplyDesiredPriorities(map[int]struct{}{positivePrio: {}})
+		err = h.fr.WithConnection(key, func(conn contracts.ActiveFlowConnection) error {
+			return nil
+		})
+		require.NoError(t, err)
+
+		h.fr.mu.RLock()
+		band, exists := h.fr.config.PriorityBands[positivePrio]
+		h.fr.mu.RUnlock()
+		require.True(t, exists, "Positive priority band should be provisioned")
+		assert.Equal(t, defaultPriorityBandMaxBytes, band.MaxBytes,
+			"Positive priorities should use DefaultPriorityBand, not the negative template")
+	})
+}
+
+// --- Concurrency Tests ---
+
+func TestFlowRegistry_Concurrency(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ConcurrentJITRegistrations_ShouldBeSafe", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+		key := flowcontrol.FlowKey{ID: "concurrent-flow", Priority: highPriority}
+		numGoroutines := 50
+		var wg sync.WaitGroup
+		wg.Add(numGoroutines)
+
+		// Hammer the `WithConnection` method for the same key from many goroutines.
+		for range numGoroutines {
+			go func() {
+				defer wg.Done()
+				err := h.fr.WithConnection(key, func(contracts.ActiveFlowConnection) error {
+					// Do a small amount of work inside the connection.
+					time.Sleep(1 * time.Millisecond)
+					return nil
+				})
+				require.NoError(t, err, "Concurrent WithConnection calls must not fail")
+			}()
+		}
+		wg.Wait()
+
+		// The primary assertion is that this completes without the race detector firing.
+		// We can also check that the flow state is consistent.
+		h.assertFlowExists(key, "Flow must exist after concurrent JIT registration")
+	})
+
+	t.Run("ShouldRecover_WhenGCDeletesFlow_DuringConnectionAttempt", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+		key := flowcontrol.FlowKey{ID: "zombie-race-flow", Priority: highPriority}
+
+		// We want to force the specific race in pinActiveFlow where:
+		// 1. User loads ptr A.
+		// 2. GC deletes ptr A from Map.
+		// 3. User checks map, sees nil or ptr B.
+		// 4. User retries.
+
+		var wg sync.WaitGroup
+		stopCh := make(chan struct{})
+
+		// Routine 1: The "User" - Constantly tries to connect.
+		wg.Go(func() {
+			for {
+				select {
+				case <-stopCh:
+					return
+				default:
+					// This triggers the optimistic loop.
+					err := h.fr.WithConnection(key, func(c contracts.ActiveFlowConnection) error {
+						return nil
+					})
+					if err != nil {
+						h.t.Logf("Connection failed during race: %v", err)
+					}
+				}
+			}
+		})
+
+		// Routine 2: The "GC" - Constantly deletes the flow.
+		wg.Go(func() {
+			for {
+				select {
+				case <-stopCh:
+					return
+				default:
+					// Forcefully delete the key to trigger the "Zombie" condition in Routine 1.
+					h.fr.flowStates.Delete(key)
+					time.Sleep(100 * time.Microsecond) // Yield briefly to let Routine 1 make progress
+				}
+			}
+		})
+
+		// Let the chaos run for a bit.
+		time.Sleep(100 * time.Millisecond)
+		close(stopCh)
+		wg.Wait()
+
+		// Final consistency check: Ensure that we can still connect successfully after the chaos.
+		// If the optimistic loop works, the final state in the map should be valid.
+		h.openConnectionOnFlow(key)
+	})
+
+	t.Run("ShouldBackOff_WhenFlowIsMarkedForDeletion_ButStillInMap", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+		key := flowcontrol.FlowKey{ID: "doomed-flow", Priority: highPriority}
+		h.openConnectionOnFlow(key)
+
+		// Get the original flow state object.
+		val, ok := h.fr.flowStates.Load(key)
+		require.True(t, ok)
+		originalState := val.(*flowState)
+
+		// Manually poison it (simulate GC step: marked but not yet deleted from map).
+		originalState.mu.Lock()
+		originalState.markedForDeletion = true
+		originalState.mu.Unlock()
+
+		// Launch a background routine to simulate the GC completing the deletion.
+		// Without this, the main thread would spin forever in pinActiveFlow reloading the same doomed object.
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			// Yield to allow the main thread to enter the retry loop and hit the "poisoned" check at least once.
+			time.Sleep(10 * time.Millisecond)
+			h.fr.flowStates.Delete(key)
+		})
+
+		// Attempt to connect.
+		// It should spin briefly, detect the deletion, create a new flow, and succeed.
+		err := h.fr.WithConnection(key, func(c contracts.ActiveFlowConnection) error {
+			return nil
+		})
+		require.NoError(t, err, "WithConnection should recover and succeed")
+		wg.Wait()
+
+		// Verification: Ensure we are using a fresh object, not the resurrected corpse.
+		newVal, ok := h.fr.flowStates.Load(key)
+		require.True(t, ok)
+		assert.NotSame(t, originalState, newVal, "Should have created a new flow object, not reused the marked one")
+	})
+
+	t.Run("ConcurrentDynamicBandProvisioning_WithGC", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+
+		const (
+			numWorkers    = 10
+			numPriorities = 20 // Create 20 different dynamic bands
+			opsPerWorker  = 10
+		)
+
+		var wg sync.WaitGroup
+		wg.Add(numWorkers + 1) // +1 for GC goroutine
+
+		// Workers: Create flows at random priorities
+		for i := range numWorkers {
+			go func() {
+				defer wg.Done()
+				for j := range opsPerWorker {
+					priority := 100 + (j % numPriorities) // Rotate through priorities
+					key := flowcontrol.FlowKey{
+						ID:       fmt.Sprintf("flow-%d-%d", i, j),
+						Priority: priority,
+					}
+					_ = h.fr.WithConnection(key, func(contracts.ActiveFlowConnection) error {
+						time.Sleep(1 * time.Millisecond)
+						return nil
+					})
+				}
+			}()
+		}
+
+		// Wait for at least one band to be created.
+		require.Eventually(t, func() bool {
+			count := 0
+			h.fr.priorityBandStates.Range(func(_, _ any) bool {
+				count++
+				return true
+			})
+			return count > 0
+		}, 5*time.Second, 10*time.Millisecond, "Dynamic bands should be created")
+
+		// Check bands were created before GC collects them all
+		bandCount := 0
+		h.fr.priorityBandStates.Range(func(_, _ any) bool {
+			bandCount++
+			return true
+		})
+		require.True(t, bandCount > 0, "Dynamic bands should be created during concurrent workload")
+
+		// GC Worker: Constantly running GC cycles
+		go func() {
+			defer wg.Done()
+			for range 10 {
+				h.fakeClock.Step(h.config.FlowGCTimeout + time.Second)
+				h.fr.ExecuteGCCycle()
+				time.Sleep(5 * time.Millisecond)
+			}
+		}()
+
+		wg.Wait()
+
+		// Primary assertion: no race detector failures
+		// Test completing without races proves concurrent band provisioning/GC is safe
+	})
+}
+
+func TestFlowRegistry_deletePriorityBand(t *testing.T) {
+	t.Parallel()
+
+	// highPriority (20) and lowPriority (10) come from package-level constants
+	const dynamicPrio = 120
+
+	t.Run("ShouldDeleteDynamicBand", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+
+		// Create a dynamic priority band via JIT provisioning
+		err := h.fr.ensurePriorityBand(dynamicPrio)
+		require.NoError(t, err)
+
+		// Verify band exists in registry config
+		h.fr.mu.RLock()
+		_, exists := h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		require.True(t, exists, "Dynamic band should exist in registry config")
+
+		// Verify band exists in registry
+
+		_, ok := h.fr.priorityBands.Load(dynamicPrio)
+		require.True(t, ok, "Band should exist")
+
+		h.fr.mu.RLock()
+
+		_, ok = h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		require.True(t, ok, "Band should exist in config")
+
+		// Delete the band
+		h.fr.priorityBandStates.Delete(dynamicPrio)
+		h.fr.cleanupPriorityBandResources([]int{dynamicPrio})
+
+		// Verify band removed from registry config
+		h.fr.mu.RLock()
+		_, exists = h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		assert.False(t, exists, "Band should be removed from registry config")
+
+		// Verify band removed from registry
+		_, ok = h.fr.priorityBands.Load(dynamicPrio)
+		assert.False(t, ok, "Band should be removed from registry")
+
+		h.fr.mu.RLock()
+		_, ok = h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		assert.False(t, ok, "Band should be removed from config")
+
+		// Verify removed from ordered list
+		for _, p := range h.fr.AllOrderedPriorityLevels() {
+			assert.NotEqual(t, dynamicPrio, p, "Band priority should be removed from ordered list in registry")
+		}
+	})
+
+	t.Run("ShouldNotAffectOtherBands", func(t *testing.T) {
+		t.Parallel()
+		// Note: this creates the highPriority, lowPriority bands
+		h := newRegistryTestHarness(t, harnessOptions{})
+
+		// Create a dynamic band
+		err := h.fr.ensurePriorityBand(dynamicPrio)
+		require.NoError(t, err)
+
+		// Verify both static and dynamic bands exist
+		h.fr.mu.RLock()
+		_, highExists := h.fr.config.PriorityBands[highPriority]
+		_, lowExists := h.fr.config.PriorityBands[lowPriority]
+		_, dynamicExists := h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		require.True(t, highExists && lowExists && dynamicExists, "All bands should exist")
+
+		// Delete the dynamic band
+		h.fr.priorityBandStates.Delete(dynamicPrio)
+		h.fr.cleanupPriorityBandResources([]int{dynamicPrio})
+
+		// Verify static bands still exist
+		h.fr.mu.RLock()
+		_, highExists = h.fr.config.PriorityBands[highPriority]
+		_, lowExists = h.fr.config.PriorityBands[lowPriority]
+		_, dynamicExists = h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+
+		assert.True(t, highExists, "Static high priority band should still exist")
+		assert.True(t, lowExists, "Static low priority band should still exist")
+		assert.False(t, dynamicExists, "Dynamic band should be deleted")
+	})
+
+	t.Run("ShouldHandleNonExistentBand", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+
+		// Try to delete a band that doesn't exist - should not panic
+		require.NotPanics(t, func() {
+			h.fr.priorityBandStates.Delete(999)
+			h.fr.cleanupPriorityBandResources([]int{999})
+		})
+	})
+}
+
+// --- Priority Band Garbage Collection Tests ---
+
+func TestFlowRegistry_PriorityBandGarbageCollection(t *testing.T) {
+	const dynamicPrio = 99
+
+	t.Run("ShouldCollectIdleDynamicBand", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{manualGC: true})
+		key := flowcontrol.FlowKey{ID: "test-flow", Priority: dynamicPrio}
+
+		// Create dynamic band via JIT provisioning
+		h.openConnectionOnFlow(key)
+
+		// Verify band exists
+		h.fr.mu.RLock()
+		_, exists := h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		require.True(t, exists, "Dynamic band should exist after flow creation")
+
+		// Step 1: Collect the flow (makes band empty)
+		h.fakeClock.Step(h.config.FlowGCTimeout + time.Second)
+		h.fr.ExecuteGCCycle()
+		h.assertFlowDoesNotExist(key, "Flow should be collected")
+
+		// Band should still exist (in grace period)
+		h.fr.mu.RLock()
+		_, exists = h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		assert.True(t, exists, "Band should still exist during grace period")
+
+		// Step 2: Wait for band GC timeout
+		h.fakeClock.Step(h.config.PriorityBandGCTimeout + time.Second)
+		h.fr.ExecuteGCCycle()
+
+		// Band should be collected
+		h.fr.mu.RLock()
+		_, exists = h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		assert.False(t, exists, "Dynamic band should be collected after timeout")
+	})
+
+	t.Run("ShouldNotCollectStaticBands", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{manualGC: true})
+
+		// Advance time well past any GC timeout
+		h.fakeClock.Step(h.config.FlowGCTimeout + h.config.PriorityBandGCTimeout + time.Hour)
+		h.fr.ExecuteGCCycle()
+
+		// Static bands should still exist
+		h.fr.mu.RLock()
+		_, highExists := h.fr.config.PriorityBands[highPriority]
+		_, lowExists := h.fr.config.PriorityBands[lowPriority]
+		h.fr.mu.RUnlock()
+
+		assert.True(t, highExists, "Static high priority band should never be collected")
+		assert.True(t, lowExists, "Static low priority band should never be collected")
+	})
+
+	t.Run("ShouldNotCollectStaticBands_AfterFlowActivity", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{manualGC: true})
+		staticPriorities := []int{highPriority, 0}
+
+		// Opening a flow at a static priority creates a transient priorityBandState whose lease
+		// drops to zero once the flow idles, making the band a GC candidate.
+		for _, priority := range staticPriorities {
+			h.openConnectionOnFlow(flowcontrol.FlowKey{ID: "static-band-flow", Priority: priority})
+		}
+
+		// Collect the flows, then age the now-idle band states past the band GC timeout.
+		h.fakeClock.Step(h.config.FlowGCTimeout + time.Second)
+		h.fr.ExecuteGCCycle()
+		h.fakeClock.Step(h.config.PriorityBandGCTimeout + time.Second)
+		h.fr.ExecuteGCCycle()
+
+		for _, priority := range staticPriorities {
+			h.fr.mu.RLock()
+			_, exists := h.fr.config.PriorityBands[priority]
+			h.fr.mu.RUnlock()
+			assert.True(t, exists, "Static band %d should survive GC after its flows are collected", priority)
+
+			key := flowcontrol.FlowKey{ID: "follow-up-flow", Priority: priority}
+			err := h.fr.WithConnection(key, func(conn contracts.ActiveFlowConnection) error { return nil })
+			assert.NoError(t, err, "Request at static priority %d should succeed after GC", priority)
+		}
+	})
+
+	t.Run("ShouldNotCollectControlPlaneDesiredBand_AfterInactivity", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{manualGC: true})
+
+		// A dynamically provisioned band (one the control plane desires but that is not in the static
+		// EPP config) must survive GC for as long as it stays desired — even after inactivity has
+		// collected all of its flows and left the band idle. Reaping an idle-but-desired band makes
+		// every request at that priority fail until the next reconcile re-provisions it. Regression: #1354.
+		const desiredPrio = -1
+		h.fr.ApplyDesiredPriorities(map[int]struct{}{desiredPrio: {}})
+
+		// A request arrives, creating then releasing a flow at the desired priority.
+		key := flowcontrol.FlowKey{ID: "batch-A", Priority: desiredPrio}
+		h.openConnectionOnFlow(key)
+
+		// Inactivity: the flow idles and is collected, dropping the band's lease to zero and
+		// making it a GC candidate, despite the control plane still desiring it.
+		h.fakeClock.Step(h.config.FlowGCTimeout + time.Second)
+		h.fr.ExecuteGCCycle()
+		h.fakeClock.Step(h.config.PriorityBandGCTimeout + time.Second)
+		h.fr.ExecuteGCCycle()
+
+		h.fr.mu.RLock()
+		_, exists := h.fr.config.PriorityBands[desiredPrio]
+		h.fr.mu.RUnlock()
+		require.True(t, exists,
+			"Control-plane-desired band %d must survive GC after inactivity", desiredPrio)
+
+		// A follow-up request to the still-desired band must not be rejected with ErrPriorityBandNotFound.
+		err := h.fr.WithConnection(key, func(conn contracts.ActiveFlowConnection) error { return nil })
+		require.NoError(t, err,
+			"Request to a still-desired band must succeed after inactivity")
+	})
+
+	t.Run("ShouldCollectMultipleBands_InOneCycle", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{manualGC: true})
+
+		// Create 3 dynamic bands
+		prio1, prio2, prio3 := 101, 102, 103
+		h.openConnectionOnFlow(flowcontrol.FlowKey{ID: "flow-1", Priority: prio1})
+		h.openConnectionOnFlow(flowcontrol.FlowKey{ID: "flow-2", Priority: prio2})
+		h.openConnectionOnFlow(flowcontrol.FlowKey{ID: "flow-3", Priority: prio3})
+
+		// Verify all bands exist
+		h.fr.mu.RLock()
+		_, exists1 := h.fr.config.PriorityBands[prio1]
+		_, exists2 := h.fr.config.PriorityBands[prio2]
+		_, exists3 := h.fr.config.PriorityBands[prio3]
+		h.fr.mu.RUnlock()
+		require.True(t, exists1 && exists2 && exists3, "All dynamic bands should exist")
+
+		// Collect all flows (all bands become empty)
+		h.fakeClock.Step(h.config.FlowGCTimeout + time.Second)
+		h.fr.ExecuteGCCycle()
+
+		// Wait for band GC timeout
+		h.fakeClock.Step(h.config.PriorityBandGCTimeout + time.Second)
+		h.fr.ExecuteGCCycle()
+
+		// All bands should be collected in a single GC cycle
+		h.fr.mu.RLock()
+		_, exists1 = h.fr.config.PriorityBands[prio1]
+		_, exists2 = h.fr.config.PriorityBands[prio2]
+		_, exists3 = h.fr.config.PriorityBands[prio3]
+		h.fr.mu.RUnlock()
+
+		assert.False(t, exists1, "Band 1 should be collected")
+		assert.False(t, exists2, "Band 2 should be collected")
+		assert.False(t, exists3, "Band 3 should be collected")
+	})
+
+	t.Run("ShouldCollectBand_AfterFlowIdle", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+		key := flowcontrol.FlowKey{ID: "test-flow", Priority: dynamicPrio}
+
+		// Create flow
+		h.openConnectionOnFlow(key)
+		// Verify band exists
+		_, ok := h.fr.priorityBands.Load(dynamicPrio)
+		require.True(t, ok, "Band should exist on registry")
+
+		// Collect the flow
+		h.fakeClock.Step(h.config.FlowGCTimeout + time.Second)
+		h.fr.ExecuteGCCycle()
+
+		// Collect the band
+		h.fakeClock.Step(h.config.PriorityBandGCTimeout + time.Second)
+		h.fr.ExecuteGCCycle()
+
+		// Verify band is removed from registry config
+		h.fr.mu.RLock()
+		_, exists := h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		assert.False(t, exists, "Band should be removed from registry config")
+
+		// Verify band is removed from the registry
+		_, ok = h.fr.priorityBands.Load(dynamicPrio)
+		assert.False(t, ok, "Band should be removed from the registry")
+
+		// Verify config also cleaned up
+		h.fr.mu.RLock()
+		_, configExists := h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		assert.False(t, configExists, "Band should be removed from the config")
+	})
+
+	t.Run("ShouldHandleConcurrentFlowCreation_DuringBandGC", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{manualGC: true})
+		key := flowcontrol.FlowKey{ID: "test-flow", Priority: dynamicPrio}
+
+		// Create and collect flow (band becomes empty)
+		h.openConnectionOnFlow(key)
+		h.fakeClock.Step(h.config.FlowGCTimeout + time.Second)
+		h.fr.ExecuteGCCycle()
+
+		// Advance past band timeout to make it a GC candidate
+		h.fakeClock.Step(h.config.PriorityBandGCTimeout + time.Second)
+
+		// Now band dynamicPrio still exists, but it is candidate for GC.
+		val, ok := h.fr.priorityBandStates.Load(dynamicPrio)
+		require.True(t, ok, "Band state should exist")
+		state := val.(*priorityBandState)
+
+		// Verify band is idle and eligible for GC
+		state.mu.Lock()
+		require.False(t, state.becameIdleAt.IsZero(), "Band should be idle")
+		require.Equal(t, 0, state.leaseCount, "Band should have no active leases")
+		state.mu.Unlock()
+
+		// Create a new flow _before_ running GC
+		// This will pin the band (increment leaseCount during provisioning)
+		newKey := flowcontrol.FlowKey{ID: "new-flow", Priority: dynamicPrio}
+		h.openConnectionOnFlow(newKey)
+
+		// Run GC - it should NOT collect the band because:
+		// 1. The band now has an active flow (not empty)
+		// 2. updateIdleBands will reset becameIdleAt because the band is no longer empty
+		h.fr.ExecuteGCCycle()
+
+		// Band should NOT be collected (new flow exists)
+		h.fr.mu.RLock()
+		_, exists := h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		assert.True(t, exists, "Band should not be collected when it has active flows")
+
+		// Verify band is no longer idle
+		state.mu.Lock()
+		isIdle := !state.becameIdleAt.IsZero()
+		state.mu.Unlock()
+		assert.False(t, isIdle, "Band should not be idle when it has flows")
+	})
+
+	t.Run("ShouldReleaseBandLease_OnJITFailure", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{manualGC: true})
+
+		// Priority dynamicPrio has no configured band, so flow provisioning fails after the band
+		// lease is optimistically acquired - exercising the lease-rollback path.
+		key := flowcontrol.FlowKey{ID: "jit-fail-flow", Priority: dynamicPrio}
+
+		err := h.fr.WithConnection(key, func(conn contracts.ActiveFlowConnection) error {
+			t.Fatal("Should not reach callback when JIT fails")
+			return nil
+		})
+		require.Error(t, err, "WithConnection should fail when flow provisioning fails")
+		require.ErrorIs(t, err, contracts.ErrPriorityBandNotFound, "Error should identify the missing band")
+
+		// The flow state must be cleaned up so a later connection can retry.
+		_, exists := h.fr.flowStates.Load(key)
+		assert.False(t, exists, "Flow state should be removed after JIT failure")
+
+		// The band lease acquired before provisioning must be released.
+		val, ok := h.fr.priorityBandStates.Load(dynamicPrio)
+		require.True(t, ok, "Band lease state should still exist")
+		state := val.(*priorityBandState)
+
+		state.mu.Lock()
+		leaseCount := state.leaseCount
+		state.mu.Unlock()
+
+		assert.Equal(t, 0, leaseCount, "Band lease should be released after JIT failure")
+	})
+
+	t.Run("ShouldMaintainBandLeaseCount_MatchingActiveFlowCount", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{manualGC: true})
+
+		// Create 3 flows at the same priority
+		key1 := flowcontrol.FlowKey{ID: "flow-1", Priority: dynamicPrio}
+		key2 := flowcontrol.FlowKey{ID: "flow-2", Priority: dynamicPrio}
+		key3 := flowcontrol.FlowKey{ID: "flow-3", Priority: dynamicPrio}
+
+		h.openConnectionOnFlow(key1)
+		h.openConnectionOnFlow(key2)
+		h.openConnectionOnFlow(key3)
+
+		// Verify band leaseCount is 3
+		val, ok := h.fr.priorityBandStates.Load(dynamicPrio)
+		require.True(t, ok, "Band state should exist")
+		state := val.(*priorityBandState)
+
+		state.mu.Lock()
+		leaseCount := state.leaseCount
+		state.mu.Unlock()
+
+		assert.Equal(t, 3, leaseCount, "Band should have 3 leases (one per flow)")
+
+		// Create flow-1 earlier than the other two, so it expires first
+		// Manipulate becameIdleAt for flow-1 to make it older
+		val1, ok1 := h.fr.flowStates.Load(key1)
+		require.True(t, ok1)
+		flow1 := val1.(*flowState)
+
+		oldTime := h.fakeClock.Now().Add(-(h.config.FlowGCTimeout + time.Second))
+		flow1.mu.Lock()
+		flow1.becameIdleAt = oldTime
+		flow1.mu.Unlock()
+
+		// Collect only flow-1 (the old one)
+		h.fr.ExecuteGCCycle()
+
+		// Verify band leaseCount is now 2
+		state.mu.Lock()
+		leaseCount = state.leaseCount
+		state.mu.Unlock()
+
+		assert.Equal(t, 2, leaseCount, "Band should have 2 leases after one flow is collected")
+
+		// Now age the remaining flows and collect them
+		h.fakeClock.Step(h.config.FlowGCTimeout + time.Second)
+		h.fr.ExecuteGCCycle()
+
+		// Verify band leaseCount is now 0
+		state.mu.Lock()
+		leaseCount = state.leaseCount
+		state.mu.Unlock()
+
+		assert.Equal(t, 0, leaseCount, "Band should have 0 leases after all flows are collected")
+	})
+
+	t.Run("ShouldNotCollectBand_WhileAnyFlowExists", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{manualGC: true})
+
+		// Create 3 flows at the same priority
+		key1 := flowcontrol.FlowKey{ID: "flow-1", Priority: dynamicPrio}
+		key2 := flowcontrol.FlowKey{ID: "flow-2", Priority: dynamicPrio}
+		key3 := flowcontrol.FlowKey{ID: "flow-3", Priority: dynamicPrio}
+
+		h.openConnectionOnFlow(key1)
+		h.openConnectionOnFlow(key2)
+		h.openConnectionOnFlow(key3)
+
+		// Manually age flow-1 and flow-2 to make them eligible for GC, but leave flow-3 young
+		oldTime := h.fakeClock.Now().Add(-(h.config.FlowGCTimeout + time.Second))
+
+		val1, _ := h.fr.flowStates.Load(key1)
+		flow1 := val1.(*flowState)
+		flow1.mu.Lock()
+		flow1.becameIdleAt = oldTime
+		flow1.mu.Unlock()
+
+		val2, _ := h.fr.flowStates.Load(key2)
+		flow2 := val2.(*flowState)
+		flow2.mu.Lock()
+		flow2.becameIdleAt = oldTime
+		flow2.mu.Unlock()
+
+		// Collect flow-1 and flow-2, leaving flow-3 active
+		h.fr.ExecuteGCCycle()
+
+		// Verify flow-3 still exists
+		h.assertFlowExists(key3, "Flow-3 should still exist")
+
+		// Verify band still exists (has flow-3)
+		h.fr.mu.RLock()
+		_, exists := h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		assert.True(t, exists, "Band should not be collected while any flow exists")
+
+		// Advance time, but NOT enough to make flow-3 eligible for GC
+		// (We need to avoid advancing past FlowGCTimeout from flow-3's creation time)
+		h.fakeClock.Step(time.Second)
+		h.fr.ExecuteGCCycle()
+
+		// Band should still NOT be collected (still has flow-3)
+		h.fr.mu.RLock()
+		_, exists = h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		assert.True(t, exists, "Band should not be collected while any flow exists")
+
+		// Verify band leaseCount is 1
+		val, ok := h.fr.priorityBandStates.Load(dynamicPrio)
+		require.True(t, ok, "Band state should exist")
+		state := val.(*priorityBandState)
+
+		state.mu.Lock()
+		leaseCount := state.leaseCount
+		state.mu.Unlock()
+
+		assert.Equal(t, 1, leaseCount, "Band should still have 1 lease")
+
+		// Collect the last flow
+		h.fakeClock.Step(h.config.FlowGCTimeout + time.Second)
+		h.fr.ExecuteGCCycle()
+
+		// Verify band leaseCount is now 0
+		state.mu.Lock()
+		leaseCount = state.leaseCount
+		state.mu.Unlock()
+
+		assert.Equal(t, 0, leaseCount, "Band should have 0 leases after last flow is collected")
+
+		// Now advance past band timeout and collect
+		h.fakeClock.Step(h.config.PriorityBandGCTimeout + time.Second)
+		h.fr.ExecuteGCCycle()
+
+		// Band should be collected now
+		h.fr.mu.RLock()
+		_, exists = h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		assert.False(t, exists, "Band should be collected after all flows are gone")
+	})
+
+	t.Run("ShouldNotCollectBand_WhenLeaseCount_NonZero_DespiteEmpty", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{manualGC: true})
+
+		key := flowcontrol.FlowKey{ID: "test-flow", Priority: dynamicPrio}
+		h.openConnectionOnFlow(key)
+
+		// Manually manipulate the state to simulate a race condition.
+		// Verify band exists and has 1 flow lease
+		val, ok := h.fr.priorityBandStates.Load(dynamicPrio)
+		require.True(t, ok, "Band state should exist")
+		state := val.(*priorityBandState)
+
+		state.mu.Lock()
+		require.Equal(t, 1, state.leaseCount, "Band should have 1 flow lease")
+		state.mu.Unlock()
+
+		// Collect the flow so the band becomes empty
+		h.fakeClock.Step(h.config.FlowGCTimeout + time.Second)
+		h.fr.ExecuteGCCycle()
+
+		// Verify band leaseCount is now 0 and band is idle
+		state.mu.Lock()
+		require.Equal(t, 0, state.leaseCount, "Band should have 0 leases")
+		require.False(t, state.becameIdleAt.IsZero(), "Band should be idle")
+		state.mu.Unlock()
+
+		// Advance past band timeout
+		oldTime := h.fakeClock.Now().Add(-h.config.PriorityBandGCTimeout * 2)
+		h.fakeClock.Step(h.config.PriorityBandGCTimeout + time.Second)
+
+		// Manually force a race: band is "Technically Idle" (timeout expired and empty)...
+		state.mu.Lock()
+		state.becameIdleAt = oldTime
+
+		// ... BUT it has a lease (simulating a flow creation happening just now).
+		// Note: In real code, these updates happen atomically during flow creation,
+		// but we force this state to verify the GC's safety priority (Lease > Empty + Time).
+		state.leaseCount = 1
+		state.mu.Unlock()
+
+		// Trigger GC
+		h.fr.ExecuteGCCycle()
+
+		// The GC should have seen leaseCount > 0 and skipped deletion, despite
+		// the band being empty and the idle timer being expired.
+		h.fr.mu.RLock()
+		_, exists := h.fr.config.PriorityBands[dynamicPrio]
+		h.fr.mu.RUnlock()
+		assert.True(t, exists, "Band must not be collected if leaseCount > 0, even if empty and idle timer expired")
+	})
+}
+
+// TestFlowRegistry_FlowErrorScoping ensures that flow provisioning errors are correctly propagated to all concurrent
+// requests waiting on the same flow initialization.
+func TestFlowRegistry_FlowErrorScoping(t *testing.T) {
+	t.Parallel()
+	defaults := newTestPriorityBandPolicyDefaults()
+
+	// Priority 100 has no configured band, so every flow provisioning attempt fails with
+	// ErrPriorityBandNotFound. That failure must be scoped to all concurrent waiters.
+	cfg, err := NewConfig(defaults)
+	require.NoError(t, err)
+
+	registry := NewFlowRegistry(cfg, logr.Discard())
+
+	key := flowcontrol.FlowKey{
+		Priority: 100,
+		ID:       "flow-should-fail",
+	}
+
+	// Simulate contention:
+	// We acquire the registry RLock while flow infrastructure is provisioned.
+	registry.mu.RLock()
+
+	const concurrency = 10
+	var successCount atomic.Int32
+	var errorCount atomic.Int32
+	wg := sync.WaitGroup{}
+	wg.Add(concurrency)
+
+	start := make(chan struct{})
+
+	for range concurrency {
+		go func() {
+			defer wg.Done()
+			<-start
+			err := registry.WithConnection(key, func(conn contracts.ActiveFlowConnection) error {
+				return nil
+			})
+			if err == nil {
+				successCount.Add(1)
+			} else {
+				errorCount.Add(1)
+			}
+		}()
+	}
+
+	close(start)
+
+	// Wait a bit to ensure everyone is stuck.
+	time.Sleep(100 * time.Millisecond)
+
+	// Release the lock, letting the winner proceed (and fail).
+	registry.mu.RUnlock()
+
+	wg.Wait()
+
+	// Assertion: all requests should fail.
+	assert.Equal(t, int32(concurrency), errorCount.Load(), "All requests should fail flow provisioning")
+	assert.Equal(t, int32(0), successCount.Load(), "No request should succeed if flow provisioning failed")
+}
+
+// countSeriesWithFairnessID gathers the global metrics registry and counts series carrying the
+// given fairness_id label value, across all metric families.
+func countSeriesWithFairnessID(t *testing.T, fairnessID string) int {
+	t.Helper()
+	families, err := crmetrics.Registry.Gather()
+	require.NoError(t, err, "gathering the metrics registry must succeed")
+	n := 0
+	for _, mf := range families {
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "fairness_id" && lp.GetValue() == fairnessID {
+					n++
+				}
+			}
+		}
+	}
+	return n
+}
+
+// Metric series are labeled by the flow's client-derived fairness ID, so they must not outlive the
+// flow: gcFlows prunes them via metrics.DeleteFlowControlFlowSeries once the flow is collected.
+func TestFlowRegistry_GarbageCollection_PrunesMetricSeries(t *testing.T) {
+	// Not parallel: reads the process-global metrics registry. The unique fairness ID keeps the
+	// assertions isolated from series recorded by other tests.
+	eppmetrics.Register()
+	h := newRegistryTestHarness(t, harnessOptions{manualGC: true})
+	const flowID = "gc-metric-prune-flow"
+	key := flowcontrol.FlowKey{ID: flowID, Priority: highPriority}
+
+	h.openConnectionOnFlow(key)
+	eppmetrics.RecordFlowControlRequestEnqueueDuration(
+		flowID, strconv.Itoa(highPriority), "Dispatched", time.Millisecond)
+	require.Positive(t, countSeriesWithFairnessID(t, flowID), "Setup: series must exist before GC")
+
+	h.fakeClock.Step(h.config.FlowGCTimeout + time.Second)
+	h.fr.ExecuteGCCycle()
+
+	h.assertFlowDoesNotExist(key, "Setup: idle flow must have been collected")
+	assert.Zero(t, countSeriesWithFairnessID(t, flowID),
+		"GC must prune every metric series labeled with the collected flow's fairness ID")
+}

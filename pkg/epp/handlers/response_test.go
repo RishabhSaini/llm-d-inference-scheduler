@@ -1,0 +1,819 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package handlers
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/structpb"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/go-logr/logr"
+	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
+	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/anthropic"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/openai"
+	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
+	eppmetrics "github.com/llm-d/llm-d-router/pkg/epp/metrics"
+)
+
+const (
+	body = `
+	{
+		"id": "cmpl-573498d260f2423f9e42817bbba3743a",
+		"object": "text_completion",
+		"created": 1732563765,
+		"model": "Qwen/Qwen3-32B",
+		"choices": [
+			{
+				"index": 0,
+				"text": " Chronicle\nThe San Francisco Chronicle has a new book review section, and it's a good one. The reviews are short, but they're well-written and well-informed. The Chronicle's book review section is a good place to start if you're looking for a good book review.\nThe Chronicle's book review section is a good place to start if you're looking for a good book review. The Chronicle's book review section",
+				"logprobs": null,
+				"finish_reason": "length",
+				"stop_reason": null,
+				"prompt_logprobs": null
+			}
+		],
+		"usage": {
+			"prompt_tokens": 11,
+			"total_tokens": 111,
+			"completion_tokens": 100
+		}
+	}
+	`
+
+	bodyWithoutUsage = `
+	{
+		"id": "cmpl-573498d260f2423f9e42817bbba3743a",
+		"object": "text_completion",
+		"created": 1732563765,
+		"model": "Qwen/Qwen3-32B",
+		"choices": [
+			{
+				"index": 0,
+				"text": " Chronicle\nThe San Francisco Chronicle has a new book review section, and it's a good one. The reviews are short, but they're well-written and well-informed. The Chronicle's book review section is a good place to start if you're looking for a good book review.\nThe Chronicle's book review section is a good place to start if you're looking for a good book review. The Chronicle's book review section",
+				"logprobs": null,
+				"finish_reason": "length",
+				"stop_reason": null,
+				"prompt_logprobs": null
+			}
+		]
+	}
+	`
+
+	bodyInvalidJSON = `
+	{
+		"id": "cmpl-573498d260f2423f9e42817bbba3743a",
+		"object": "text_completion",
+		"created": 1732563765,
+		"model": "Qwen/Qwen3-32B",
+		"choices": [
+			{
+				"invalid json"
+			}
+		]
+	}
+	`
+
+	bodyWithCachedTokens = `
+	{
+		"id": "cmpl-573498d260f2423f9e42817bbba3743a",
+		"object": "text_completion",
+		"created": 1732563765,
+		"model": "Qwen/Qwen3-32B",
+		"choices": [
+			{
+				"index": 0,
+				"text": " Chronicle\nThe San Francisco Chronicle has a new book review section, and it's a good one. The reviews are short, but they're well-written and well-informed. The Chronicle's book review section is a good place to start if you're looking for a good book review.\nThe Chronicle's book review section is a good place to start if you're looking for a good book review. The Chronicle's book review section",
+				"logprobs": null,
+				"finish_reason": "length",
+				"stop_reason": null,
+				"prompt_logprobs": null
+			}
+		],
+		"usage": {
+			"prompt_tokens": 11,
+			"total_tokens": 111,
+			"completion_tokens": 100,
+			"prompt_tokens_details": {
+				"cached_tokens": 10
+			}
+		}
+	}
+	`
+
+	streamingBodyWithoutUsage = `data: {"id":"cmpl-41764c93-f9d2-4f31-be08-3ba04fa25394","object":"text_completion","created":1740002445,"model":"food-review-0","choices":[],"usage":null}
+	`
+
+	streamingBodyWithUsage = `data: {"id":"cmpl-41764c93-f9d2-4f31-be08-3ba04fa25394","object":"text_completion","created":1740002445,"model":"food-review-0","choices":[],"usage":{"prompt_tokens":7,"total_tokens":17,"completion_tokens":10}}
+data: [DONE]
+	`
+	streamingBodyWithUsageAndCachedTokens = `data: {"id":"cmpl-41764c93-f9d2-4f31-be08-3ba04fa25394","object":"text_completion","created":1740002445,"model":"food-review-0","choices":[],"usage":{"prompt_tokens":7,"total_tokens":17,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":5}}}
+data: [DONE]
+	`
+)
+
+type mockDirector struct{}
+
+func (m *mockDirector) HandleResponseBody(ctx context.Context, reqCtx *RequestContext, endOfStream bool) *RequestContext {
+	return reqCtx
+}
+func (m *mockDirector) HandleResponseHeader(ctx context.Context, reqCtx *RequestContext) *RequestContext {
+	return reqCtx
+}
+func (m *mockDirector) GetRandomEndpoint() *fwkdl.EndpointMetadata {
+	return &fwkdl.EndpointMetadata{}
+}
+func (m *mockDirector) HandleRequest(ctx context.Context, reqCtx *RequestContext, inferenceRequestBody *fwkrh.InferenceRequestBody) (*RequestContext, error) {
+	return reqCtx, nil
+}
+
+func TestHandleResponseBody(t *testing.T) {
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+
+	tests := []struct {
+		name   string
+		body   []byte
+		reqCtx *RequestContext
+		want   fwkrh.Usage
+	}{
+		{
+			name: "success",
+			body: []byte(body),
+			want: fwkrh.Usage{
+				PromptTokens:     11,
+				TotalTokens:      111,
+				CompletionTokens: 100,
+			},
+		},
+		{
+			name: "success with cached tokens",
+			body: []byte(bodyWithCachedTokens),
+			want: fwkrh.Usage{
+				PromptTokens:     11,
+				TotalTokens:      111,
+				CompletionTokens: 100,
+				PromptTokenDetails: &fwkrh.PromptTokenDetails{
+					CachedTokens: 10,
+				},
+			},
+		},
+		{
+			name: "success body without usage, the HandleResponseBody should still return non-nil error",
+			body: []byte(bodyWithoutUsage),
+			want: fwkrh.Usage{}, // Since the usage is not set in the responseBody, this usage should be empty.
+		},
+		{
+			name: "success invalid joson body, the HandleResponseBody should still return non-nil error",
+			body: []byte(bodyInvalidJSON),
+			want: fwkrh.Usage{}, // Since the response is invalid json, the usage cannot be extrcated.
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := &StreamingServer{
+				parserRegistry: NewParserRegistry([]fwkrh.Parser{openai.NewOpenAIParser()}, logr.Discard()),
+			}
+			server.director = &mockDirector{}
+			reqCtx := test.reqCtx
+			if reqCtx == nil {
+				reqCtx = &RequestContext{
+					Response:          &Response{},
+					SchedulingRequest: &fwksched.InferenceRequest{FairnessID: metadata.DefaultFairnessID},
+				}
+			}
+			server.HandleResponseBody(ctx, reqCtx, test.body, true)
+			if diff := cmp.Diff(test.want, reqCtx.Usage); diff != "" {
+				t.Errorf("HandleResponseBody returned unexpected response, diff(-want, +got): %v", diff)
+			}
+		})
+	}
+}
+
+func TestHandleStreamedResponseBody(t *testing.T) {
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	tests := []struct {
+		name    string
+		body    []byte
+		want    fwkrh.Usage
+		wantErr bool
+	}{
+		{
+			name:    "streaming request without usage",
+			body:    []byte(streamingBodyWithoutUsage),
+			wantErr: false,
+			// In the middle of streaming response, so request context response is not set yet.
+		},
+		{
+			name:    "streaming request with usage",
+			body:    []byte(streamingBodyWithUsage),
+			wantErr: false,
+			want: fwkrh.Usage{
+				PromptTokens:     7,
+				TotalTokens:      17,
+				CompletionTokens: 10,
+			},
+		},
+		{
+			name:    "streaming request with usage and cached tokens",
+			body:    []byte(streamingBodyWithUsageAndCachedTokens),
+			wantErr: false,
+			want: fwkrh.Usage{
+				PromptTokens:     7,
+				TotalTokens:      17,
+				CompletionTokens: 10,
+				PromptTokenDetails: &fwkrh.PromptTokenDetails{
+					CachedTokens: 5,
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := &StreamingServer{
+				parserRegistry: NewParserRegistry([]fwkrh.Parser{openai.NewOpenAIParser()}, logr.Discard()),
+			}
+			server.director = &mockDirector{}
+			reqCtx := &RequestContext{
+				Response: &Response{
+					Headers: map[string]string{
+						"content-type": "text/event-stream; charset=utf-8",
+					},
+				},
+				SchedulingRequest: &fwksched.InferenceRequest{FairnessID: metadata.DefaultFairnessID},
+			}
+			server.HandleResponseBody(ctx, reqCtx, test.body, true) // Hard coded to true since openAIParser does not endOfStream to switch logic.
+
+			if diff := cmp.Diff(test.want, reqCtx.Usage); diff != "" {
+				t.Errorf("HandleResponseBody returned unexpected response, diff(-want, +got): %v", diff)
+			}
+		})
+	}
+}
+
+func TestHandleResponseBodyWithoutSchedulingRequest(t *testing.T) {
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	eppmetrics.Register()
+	eppmetrics.Reset()
+	t.Cleanup(eppmetrics.Reset)
+
+	server := &StreamingServer{
+		parserRegistry: NewParserRegistry([]fwkrh.Parser{openai.NewOpenAIParser()}, logr.Discard()),
+	}
+	server.director = &mockDirector{}
+	timeBaseline := time.Now()
+	reqCtx := &RequestContext{
+		IncomingModelName:         "incoming-model",
+		TargetModelName:           "target-model",
+		Priority:                  3,
+		RequestReceivedTimestamp:  timeBaseline,
+		responseCompleteTimestamp: timeBaseline.Add(time.Second),
+		Response: &Response{
+			Headers: map[string]string{},
+		},
+	}
+
+	require.NotPanics(t, func() {
+		server.HandleResponseBody(ctx, reqCtx, []byte(body), true)
+	})
+
+	histogram := findHistogramMetric(t, "llm_d_epp_request_ntpot_seconds", map[string]string{
+		"model_name":        "incoming-model",
+		"target_model_name": "target-model",
+		"fairness_id":       metadata.DefaultFairnessID,
+		"priority":          "3",
+	})
+	require.Equal(t, uint64(1), histogram.GetSampleCount())
+}
+
+func findHistogramMetric(t *testing.T, name string, labels map[string]string) *dto.Histogram {
+	t.Helper()
+
+	families, err := ctrlmetrics.Registry.Gather()
+	require.NoError(t, err)
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			if metricHasLabels(metric, labels) {
+				return metric.GetHistogram()
+			}
+		}
+	}
+	t.Fatalf("metric %q with labels %v not found", name, labels)
+	return nil
+}
+
+func metricHasLabels(metric *dto.Metric, labels map[string]string) bool {
+	got := make(map[string]string, len(metric.GetLabel()))
+	for _, label := range metric.GetLabel() {
+		got[label.GetName()] = label.GetValue()
+	}
+	for key, want := range labels {
+		if got[key] != want {
+			return false
+		}
+	}
+	return true
+}
+
+func TestHandleResponseBodyModelStreaming_TokenAccumulation(t *testing.T) {
+	t.Parallel()
+
+	type chunkStream struct {
+		body        []byte
+		endOfStream bool
+	}
+
+	tests := []struct {
+		name      string
+		chunks    []chunkStream
+		wantUsage fwkrh.Usage
+	}{
+		{
+			name: "Standard: Usage and DONE in same chunk",
+			chunks: []chunkStream{
+				{body: []byte(`data: {"usage":{"prompt_tokens":5,"completion_tokens":10,"total_tokens":15}}` + "\n" + `data: [DONE]`), endOfStream: true},
+			},
+			wantUsage: fwkrh.Usage{PromptTokens: 5, CompletionTokens: 10, TotalTokens: 15},
+		},
+		{
+			name: "Split: Usage in Chunk 1, DONE in Chunk 2",
+			chunks: []chunkStream{
+				// Chunk 1: Usage data arrives
+				{body: []byte(`data: {"usage":{"prompt_tokens":5,"completion_tokens":10,"total_tokens":15}}` + "\n"), endOfStream: false},
+				// Chunk 2: Stream termination. Should NOT overwrite the usage from Chunk 1.
+				{body: []byte(`data: [DONE]`), endOfStream: true},
+			},
+			wantUsage: fwkrh.Usage{PromptTokens: 5, CompletionTokens: 10, TotalTokens: 15},
+		},
+		{
+			name: "Fragmented: Content -> Usage -> DONE",
+			chunks: []chunkStream{
+				{body: []byte(`data: {"choices":[{"text":"Hello"}]}` + "\n"), endOfStream: false},
+				{body: []byte(`data: {"usage":{"prompt_tokens":5,"completion_tokens":10,"total_tokens":15}}` + "\n"), endOfStream: false},
+				{body: []byte(`data: [DONE]`), endOfStream: true},
+			},
+			wantUsage: fwkrh.Usage{PromptTokens: 5, CompletionTokens: 10, TotalTokens: 15},
+		},
+		{
+			name: "No Usage Data",
+			chunks: []chunkStream{
+				{body: []byte(`data: {"choices":[{"text":"Hello"}]}` + "\n"), endOfStream: false},
+				{body: []byte(`data: [DONE]`), endOfStream: true},
+			},
+			wantUsage: fwkrh.Usage{}, // Zero values
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &StreamingServer{
+				parserRegistry: NewParserRegistry([]fwkrh.Parser{openai.NewOpenAIParser()}, logr.Discard()),
+				director:       &mockDirector{},
+			}
+			reqCtx := &RequestContext{
+				Response: &Response{
+					Headers: map[string]string{
+						"content-type": "text/event-stream",
+					},
+				},
+				SchedulingRequest: &fwksched.InferenceRequest{FairnessID: metadata.DefaultFairnessID},
+			}
+
+			for _, chunk := range tc.chunks {
+				server.HandleResponseBody(context.Background(), reqCtx, chunk.body, chunk.endOfStream)
+			}
+
+			assert.Equal(t, tc.wantUsage, reqCtx.Usage, "Usage data should match expected accumulation")
+		})
+	}
+}
+
+// The Anthropic streaming format reports prompt tokens in message_start and completion
+// tokens in a message_delta that reaches the EPP in a later chunk.
+func TestHandleResponseBodyModelStreaming_AnthropicUsageAccumulation(t *testing.T) {
+	eppmetrics.Register()
+	eppmetrics.Reset()
+	t.Cleanup(eppmetrics.Reset)
+
+	chunks := [][]byte{
+		[]byte(`event: message_start` + "\n" + `data: {"type":"message_start","message":{"usage":{"input_tokens":1000,"cache_read_input_tokens":800}}}` + "\n\n"),
+		[]byte(`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}` + "\n\n"),
+		[]byte(`event: message_delta` + "\n" + `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":200}}` + "\n\n"),
+		[]byte(`event: message_stop` + "\n" + `data: {"type":"message_stop"}`),
+	}
+
+	server := &StreamingServer{
+		parserRegistry: NewParserRegistry([]fwkrh.Parser{anthropic.NewAnthropicParser()}, logr.Discard()),
+		director:       &mockDirector{},
+	}
+	reqCtx := &RequestContext{
+		IncomingModelName: "incoming-model",
+		TargetModelName:   "target-model",
+		Request: &Request{
+			Headers: map[string]string{
+				":path": "/v1/messages",
+			},
+		},
+		Response: &Response{
+			Headers: map[string]string{
+				"content-type": "text/event-stream",
+			},
+		},
+		SchedulingRequest: &fwksched.InferenceRequest{FairnessID: metadata.DefaultFairnessID},
+	}
+
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	for i, chunk := range chunks {
+		server.HandleResponseBody(ctx, reqCtx, chunk, i == len(chunks)-1)
+	}
+
+	wantUsage := fwkrh.Usage{
+		PromptTokens:       1000,
+		CompletionTokens:   200,
+		TotalTokens:        1200,
+		PromptTokenDetails: &fwkrh.PromptTokenDetails{CachedTokens: 800},
+	}
+	assert.Equal(t, wantUsage, reqCtx.Usage, "message_delta must not discard the usage reported by message_start")
+
+	labels := map[string]string{
+		"model_name":        "incoming-model",
+		"target_model_name": "target-model",
+		"fairness_id":       metadata.DefaultFairnessID,
+		"priority":          "0",
+	}
+	// Each token count belongs to one request, so accumulating usage across chunks must not
+	// turn into a second observation on the chunk that completes it.
+	inputTokens := findHistogramMetric(t, "llm_d_epp_request_input_tokens", labels)
+	require.Equal(t, uint64(1), inputTokens.GetSampleCount())
+	require.Equal(t, float64(1000), inputTokens.GetSampleSum())
+
+	cachedTokens := findHistogramMetric(t, "llm_d_epp_request_cached_tokens", labels)
+	require.Equal(t, uint64(1), cachedTokens.GetSampleCount())
+	require.Equal(t, float64(800), cachedTokens.GetSampleSum())
+
+	outputTokens := findHistogramMetric(t, "llm_d_epp_request_output_tokens", labels)
+	require.Equal(t, uint64(1), outputTokens.GetSampleCount())
+	require.Equal(t, float64(200), outputTokens.GetSampleSum())
+}
+
+func TestGenerateResponseHeaders_Sanitization(t *testing.T) {
+	server := &StreamingServer{}
+	reqCtx := &RequestContext{
+		Response: &Response{
+			Headers: map[string]string{
+				"x-backend-server":              "vllm-v0.6.3",                // should passthrough
+				metadata.ObjectiveKey:           "sensitive-objective-id",     // should be stripped
+				metadata.OldObjectiveKey:        "old-sensitive-objective-id", // should be stripped
+				metadata.DestinationEndpointKey: "10.2.0.5:8080",              // should be stripped
+				"content-length":                "500",                        // should be stripped
+			},
+		},
+	}
+
+	results := server.generateResponseHeaders(reqCtx)
+
+	gotHeaders := make(map[string]string)
+	for _, h := range results {
+		gotHeaders[h.Header.Key] = string(h.Header.RawValue)
+	}
+
+	assert.Contains(t, gotHeaders, "x-backend-server")
+	assert.Contains(t, gotHeaders, "x-went-into-resp-headers")
+	assert.NotContains(t, gotHeaders, metadata.ObjectiveKey)
+	assert.NotContains(t, gotHeaders, metadata.OldObjectiveKey)
+	assert.NotContains(t, gotHeaders, metadata.DestinationEndpointKey)
+	assert.NotContains(t, gotHeaders, "content-length")
+}
+
+func TestGenerateResponseHeaders_FlowQueueDuration(t *testing.T) {
+	server := &StreamingServer{}
+
+	tests := []struct {
+		name      string
+		admitted  bool
+		duration  time.Duration
+		wantValue string
+		wantEmit  bool
+	}{
+		{
+			name:     "not admitted omits header",
+			admitted: false,
+			wantEmit: false,
+		},
+		{
+			name:      "admitted with zero wait emits 0",
+			admitted:  true,
+			duration:  500 * time.Microsecond,
+			wantValue: "0",
+			wantEmit:  true,
+		},
+		{
+			name:      "admitted with measurable wait emits milliseconds",
+			admitted:  true,
+			duration:  1500 * time.Millisecond,
+			wantValue: "1500",
+			wantEmit:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reqCtx := &RequestContext{
+				FlowControlAdmitted:      tc.admitted,
+				FlowControlQueueDuration: tc.duration,
+				Response:                 &Response{Headers: map[string]string{}},
+			}
+
+			gotHeaders := make(map[string]string)
+			for _, h := range server.generateResponseHeaders(reqCtx) {
+				gotHeaders[h.Header.Key] = string(h.Header.RawValue)
+			}
+
+			if tc.wantEmit {
+				assert.Equal(t, tc.wantValue, gotHeaders[metadata.FlowQueueDurationHeaderKey])
+			} else {
+				assert.NotContains(t, gotHeaders, metadata.FlowQueueDurationHeaderKey)
+			}
+		})
+	}
+}
+
+func TestRewriteModelName(t *testing.T) {
+	tests := []struct {
+		name          string
+		body          string
+		targetModel   string
+		incomingModel string
+		want          string
+		wantMutated   bool
+	}{
+		{
+			name:          "non-streaming response with model rewrite",
+			body:          `{"id":"cmpl-123","model":"vllm-backend-01","choices":[]}`,
+			targetModel:   "vllm-backend-01",
+			incomingModel: "gpt-4-proxy",
+			want:          `{"id":"cmpl-123","model":"gpt-4-proxy","choices":[]}`,
+			wantMutated:   true,
+		},
+		{
+			name:          "streaming SSE chunk with model rewrite",
+			body:          `data: {"id":"cmpl-123","model":"vllm-backend-01","choices":[]}` + "\n\n",
+			targetModel:   "vllm-backend-01",
+			incomingModel: "gpt-4-proxy",
+			want:          `data: {"id":"cmpl-123","model":"gpt-4-proxy","choices":[]}` + "\n\n",
+			wantMutated:   true,
+		},
+		{
+			name:          "no rewrite when names are the same",
+			body:          `{"model":"same-model"}`,
+			targetModel:   "same-model",
+			incomingModel: "same-model",
+			want:          `{"model":"same-model"}`,
+			wantMutated:   false,
+		},
+		{
+			name:          "no rewrite when target is empty",
+			body:          `{"model":"some-model"}`,
+			targetModel:   "",
+			incomingModel: "gpt-4-proxy",
+			want:          `{"model":"some-model"}`,
+			wantMutated:   false,
+		},
+		{
+			name:          "no rewrite when incoming is empty",
+			body:          `{"model":"some-model"}`,
+			targetModel:   "some-model",
+			incomingModel: "",
+			want:          `{"model":"some-model"}`,
+			wantMutated:   false,
+		},
+		{
+			name:          "model field with space after colon",
+			body:          `{"model": "vllm-backend-01"}`,
+			targetModel:   "vllm-backend-01",
+			incomingModel: "gpt-4-proxy",
+			want:          `{"model": "gpt-4-proxy"}`,
+			wantMutated:   true,
+		},
+		{
+			name:          "body without model field is unchanged",
+			body:          `{"id":"cmpl-123","choices":[]}`,
+			targetModel:   "vllm-backend-01",
+			incomingModel: "gpt-4-proxy",
+			want:          `{"id":"cmpl-123","choices":[]}`,
+			wantMutated:   false,
+		},
+		{
+			name:          "DONE marker is not affected",
+			body:          "data: [DONE]\n",
+			targetModel:   "vllm-backend-01",
+			incomingModel: "gpt-4-proxy",
+			want:          "data: [DONE]\n",
+			wantMutated:   false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, mutated := rewriteModelName([]byte(tc.body), tc.targetModel, tc.incomingModel)
+			assert.Equal(t, tc.want, string(got))
+			assert.Equal(t, tc.wantMutated, mutated)
+		})
+	}
+}
+
+func TestResponseSizeAccumulation(t *testing.T) {
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+
+	tests := []struct {
+		name             string
+		chunks           [][]byte
+		wantResponseSize int
+	}{
+		{
+			name:             "single chunk",
+			chunks:           [][]byte{[]byte("hello world")},
+			wantResponseSize: 11,
+		},
+		{
+			name:             "multiple chunks",
+			chunks:           [][]byte{[]byte("chunk1"), []byte("chunk2"), []byte("chunk3")},
+			wantResponseSize: 18,
+		},
+		{
+			name:             "empty chunk",
+			chunks:           [][]byte{[]byte("")},
+			wantResponseSize: 0,
+		},
+		{
+			name:             "mixed chunks with empty",
+			chunks:           [][]byte{[]byte("data"), []byte(""), []byte("more")},
+			wantResponseSize: 8,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := &StreamingServer{
+				parserRegistry: NewParserRegistry([]fwkrh.Parser{openai.NewOpenAIParser()}, logr.Discard()),
+				director:       &mockDirector{},
+			}
+			reqCtx := &RequestContext{
+				Response: &Response{
+					Headers: map[string]string{},
+				},
+				SchedulingRequest: &fwksched.InferenceRequest{FairnessID: metadata.DefaultFairnessID},
+			}
+			for i, chunk := range tt.chunks {
+				endOfStream := i == len(tt.chunks)-1
+				server.HandleResponseBody(ctx, reqCtx, chunk, endOfStream)
+			}
+			assert.Equal(t, tt.wantResponseSize, reqCtx.responseSize)
+		})
+	}
+}
+
+func TestStreamedEventAccumulation(t *testing.T) {
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+
+	tests := []struct {
+		name               string
+		headers            map[string]string
+		chunks             [][]byte
+		wantStreamedEvents int
+	}{
+		{
+			name:    "events accumulate across chunks",
+			headers: map[string]string{"content-type": "text/event-stream"},
+			chunks: [][]byte{
+				[]byte(`data: {"choices":[{"text":"He"}]}` + "\n" + `data: {"choices":[{"text":"llo"}]}` + "\n"),
+				[]byte(`data: {"choices":[{"text":"!"}]}` + "\n" + `data: [DONE]`),
+			},
+			wantStreamedEvents: 3,
+		},
+		{
+			name:               "a truncated stream keeps the count it reached",
+			headers:            map[string]string{"content-type": "text/event-stream"},
+			chunks:             [][]byte{[]byte(`data: {"choices":[{"text":"He"}]}` + "\n")},
+			wantStreamedEvents: 1,
+		},
+		{
+			name:    "an event cut after the prefix at a chunk boundary counts once",
+			headers: map[string]string{"content-type": "text/event-stream"},
+			chunks: [][]byte{
+				[]byte(`data: {"choices":[{"text":"He"}]}` + "\n" + `data: {"cho`),
+				[]byte(`ices":[{"text":"llo"}]}` + "\n" + `data: [DONE]`),
+			},
+			wantStreamedEvents: 2,
+		},
+		{
+			name:               "a non-streamed response counts nothing",
+			headers:            map[string]string{"content-type": "application/json"},
+			chunks:             [][]byte{[]byte(body)},
+			wantStreamedEvents: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := &StreamingServer{
+				parserRegistry: NewParserRegistry([]fwkrh.Parser{openai.NewOpenAIParser()}, logr.Discard()),
+				director:       &mockDirector{},
+			}
+			reqCtx := &RequestContext{
+				Response:          &Response{Headers: tt.headers},
+				SchedulingRequest: &fwksched.InferenceRequest{FairnessID: metadata.DefaultFairnessID},
+			}
+			for i, chunk := range tt.chunks {
+				server.HandleResponseBody(ctx, reqCtx, chunk, i == len(tt.chunks)-1)
+			}
+			assert.Equal(t, tt.wantStreamedEvents, reqCtx.StreamedEvents)
+		})
+	}
+}
+
+// TestGenerateResponseBodyResponses_DynamicMetadata verifies that DynamicMetadata is attached
+// to the last ProcessingResponse chunk and not to earlier chunks. This is a regression test for
+// the bug where the metadata was computed by plugins but silently dropped before reaching Envoy.
+func TestGenerateResponseBodyResponses_DynamicMetadata(t *testing.T) {
+	meta := &structpb.Struct{
+		Fields: map[string]*structpb.Value{
+			"envoy.lb": structpb.NewStructValue(&structpb.Struct{
+				Fields: map[string]*structpb.Value{
+					"x-gateway-inference-request-cost": structpb.NewNumberValue(42),
+				},
+			}),
+		},
+	}
+
+	tests := []struct {
+		name            string
+		body            []byte
+		dynamicMetadata *structpb.Struct
+		wantMetaOnLast  bool
+	}{
+		{
+			name:            "metadata attached to last chunk when provided",
+			body:            []byte(`{"result":"ok"}`),
+			dynamicMetadata: meta,
+			wantMetaOnLast:  true,
+		},
+		{
+			name:            "no metadata when nil",
+			body:            []byte(`{"result":"ok"}`),
+			dynamicMetadata: nil,
+			wantMetaOnLast:  false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			responses := generateResponseBodyResponses(tc.body, true, tc.dynamicMetadata)
+			require.NotEmpty(t, responses, "expected at least one response")
+
+			last := responses[len(responses)-1]
+			if tc.wantMetaOnLast {
+				require.NotNil(t, last.DynamicMetadata, "expected DynamicMetadata on last chunk")
+				envoyLb, ok := last.DynamicMetadata.Fields["envoy.lb"]
+				require.True(t, ok, "expected envoy.lb namespace in DynamicMetadata")
+				cost, ok := envoyLb.GetStructValue().Fields["x-gateway-inference-request-cost"]
+				require.True(t, ok)
+				assert.Equal(t, float64(42), cost.GetNumberValue())
+			} else {
+				assert.Nil(t, last.DynamicMetadata, "expected no DynamicMetadata when none provided")
+			}
+
+			// Earlier chunks must never carry metadata.
+			for i, r := range responses[:len(responses)-1] {
+				assert.Nil(t, r.DynamicMetadata, "chunk %d should not have DynamicMetadata", i)
+			}
+		})
+	}
+}

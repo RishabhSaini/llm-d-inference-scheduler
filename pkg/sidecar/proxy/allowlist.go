@@ -19,7 +19,6 @@ package proxy
 import (
 	"context"
 	"fmt"
-	"net"
 	"sync"
 	"time"
 
@@ -33,16 +32,23 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/klog/v2"
 	"k8s.io/utils/set"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 )
 
 const (
-	inferencePoolGroup    = "inference.networking.x-k8s.io"
-	inferencePoolVersion  = "v1alpha2"
 	inferencePoolResource = "inferencepools"
 	resyncPeriod          = 30 * time.Second
 )
+
+// InferencePool API group to version mapping
+var inferencePoolGroupToVersion = map[string]string{
+	routing.InferencePoolAPIGroup:   "v1",
+	"inference.networking.x-k8s.io": "v1alpha2", // TODO: deprecated should be clean up
+}
 
 // AllowlistValidator manages allowed prefill targets based on InferencePool resources
 type AllowlistValidator struct {
@@ -51,6 +57,8 @@ type AllowlistValidator struct {
 	namespace     string
 	poolName      string
 	enabled       bool
+
+	gvr schema.GroupVersionResource // detected GVR
 
 	// allowedTargets maps hostport -> bool for allowed prefill targets
 	allowedTargets   set.Set[string]
@@ -65,11 +73,24 @@ type AllowlistValidator struct {
 }
 
 // NewAllowlistValidator creates a new SSRF protection validator
-func NewAllowlistValidator(enabled bool, namespace string, poolName string) (*AllowlistValidator, error) {
+func NewAllowlistValidator(enabled bool, poolGroup, namespace, poolName string) (*AllowlistValidator, error) {
 	if !enabled {
 		return &AllowlistValidator{
 			enabled: false,
 		}, nil
+	}
+
+	// Determine version based on poolGroup
+	version, exists := inferencePoolGroupToVersion[poolGroup]
+	if !exists {
+		return nil, fmt.Errorf("unsupported poolGroup: %s, "+
+			"must be one of %v", poolGroup, getSupportedPoolGroups())
+	}
+
+	gvr := schema.GroupVersionResource{
+		Group:    poolGroup,
+		Version:  version,
+		Resource: inferencePoolResource,
 	}
 
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
@@ -92,11 +113,20 @@ func NewAllowlistValidator(enabled bool, namespace string, poolName string) (*Al
 		dynamicClient:  dynamicClient,
 		namespace:      namespace,
 		poolName:       poolName,
+		gvr:            gvr,
 		allowedTargets: set.New[string](),
 		podInformers:   make(map[string]cache.SharedInformer),
 		podStopChans:   make(map[string]chan struct{}),
 		stopCh:         make(chan struct{}),
 	}, nil
+}
+
+func getSupportedPoolGroups() []string {
+	groups := make([]string, 0, len(inferencePoolGroupToVersion))
+	for group := range inferencePoolGroupToVersion {
+		groups = append(groups, group)
+	}
+	return groups
 }
 
 // Start begins watching InferencePool resources and managing the allowlist
@@ -105,26 +135,21 @@ func (av *AllowlistValidator) Start(ctx context.Context) error {
 		return nil
 	}
 
-	av.logger = klog.FromContext(ctx).WithName("allowlist-validator")
-	av.logger.Info("starting SSRF protection allowlist validator", "namespace", av.namespace, "poolName", av.poolName)
-
-	gvr := schema.GroupVersionResource{
-		Group:    inferencePoolGroup,
-		Version:  inferencePoolVersion,
-		Resource: inferencePoolResource,
-	}
+	av.logger = log.FromContext(ctx).WithName("allowlist-validator")
+	av.logger.Info("starting SSRF protection allowlist validator",
+		"namespace", av.namespace, "poolName", av.poolName, "gvr", av.gvr.String())
 
 	// Create informer for the specific InferencePool resource
 	lw := &cache.ListWatch{
-		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+		ListWithContextFunc: func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
 			// List with field selector to get only the specific InferencePool
 			options.FieldSelector = "metadata.name=" + av.poolName
-			return av.dynamicClient.Resource(gvr).Namespace(av.namespace).List(ctx, options)
+			return av.dynamicClient.Resource(av.gvr).Namespace(av.namespace).List(ctx, options)
 		},
-		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+		WatchFuncWithContext: func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
 			// Watch the specific InferencePool by name using field selector
 			options.FieldSelector = "metadata.name=" + av.poolName
-			return av.dynamicClient.Resource(gvr).Namespace(av.namespace).Watch(ctx, options)
+			return av.dynamicClient.Resource(av.gvr).Namespace(av.namespace).Watch(ctx, options)
 		},
 	}
 
@@ -142,7 +167,7 @@ func (av *AllowlistValidator) Start(ctx context.Context) error {
 
 	// Wait for cache sync
 	if !cache.WaitForCacheSync(av.stopCh, av.poolInformer.HasSynced) {
-		return fmt.Errorf("failed to sync InferencePool cache within timeout (check RBAC permissions for inferencepools.%s and that pool '%s' exists)", inferencePoolGroup, av.poolName)
+		return fmt.Errorf("failed to sync InferencePool cache within timeout (check RBAC permissions for inferencepools.%s and that pool '%s' exists)", av.gvr.String(), av.poolName)
 	}
 
 	av.logger.Info("allowlist validator started successfully")
@@ -160,7 +185,7 @@ func (av *AllowlistValidator) Stop() {
 	// Stop all pod informers first
 	av.podInformersMu.Lock()
 	for poolName, stopCh := range av.podStopChans {
-		av.logger.V(4).Info("stopping pod informer", "pool", poolName)
+		av.logger.V(logging.DEBUG).Info("stopping pod informer", "pool", poolName)
 		close(stopCh)
 	}
 	// Clear the maps
@@ -180,28 +205,14 @@ func (av *AllowlistValidator) IsAllowed(hostPort string) bool {
 	}
 
 	// Clean up the hostPort input
-	hostPort = av.normalizeHostPort(hostPort)
+	hostPort = extractHost(hostPort)
 
 	av.allowedTargetsMu.RLock()
 	defer av.allowedTargetsMu.RUnlock()
 
 	allowed := av.allowedTargets.Has(hostPort)
-	av.logger.V(4).Info("allowlist check", "hostPort", hostPort, "allowed", allowed)
+	av.logger.V(logging.DEBUG).Info("allowlist check", "hostPort", hostPort, "allowed", allowed)
 	return allowed
-}
-
-// normalizeHostPort extracts the host part from a host:port string
-func (av *AllowlistValidator) normalizeHostPort(hostPort string) string {
-	// Use net.SplitHostPort to handle IPv6 addresses and ports
-	host, _, err := net.SplitHostPort(hostPort)
-	if err != nil {
-		// If net.SplitHostPort fails, it's likely just a hostname without port
-		av.logger.V(5).Info("could not parse host:port, treating as hostname",
-			"input", hostPort,
-			"error", err.Error())
-		return hostPort
-	}
-	return host
 }
 
 // onInferencePoolAdd handles new InferencePool resources
@@ -241,27 +252,34 @@ func (av *AllowlistValidator) onInferencePoolDelete(obj interface{}) {
 func (av *AllowlistValidator) updatePodsForPool(poolObj *unstructured.Unstructured) {
 	poolName := poolObj.GetName()
 
-	// Parse the pool spec to get selector
+	selector, err := av.poolSelector(poolObj)
+	if err != nil {
+		av.logger.Error(err, "failed to extract selector from InferencePool", "name", poolName)
+		return
+	}
+
+	av.createPodInformer(poolName, selector)
+}
+
+func (av *AllowlistValidator) poolSelector(poolObj *unstructured.Unstructured) (labels.Selector, error) {
 	spec, found, err := unstructured.NestedMap(poolObj.Object, "spec")
 	if err != nil || !found {
-		av.logger.Error(err, "InferencePool missing or invalid spec field", "name", poolName, "found", found)
-		return
+		return nil, fmt.Errorf("missing or invalid spec field (found=%t): %w", found, err)
 	}
 
-	selectorData, found, err := unstructured.NestedMap(spec, "selector")
+	// GA API (inference.networking.k8s.io) uses spec.selector.matchLabels;
+	// deprecated alpha API (inference.networking.x-k8s.io) uses a flat spec.selector map.
+	selectorPath := []string{"selector", "matchLabels"}
+	if av.gvr.Group != routing.InferencePoolAPIGroup {
+		selectorPath = []string{"selector"}
+	}
+
+	selectorData, found, err := unstructured.NestedStringMap(spec, selectorPath...)
 	if err != nil || !found {
-		av.logger.Error(err, "InferencePool missing or invalid selector field", "name", poolName, "found", found)
-		return
+		return nil, fmt.Errorf("missing or invalid selector field at %v (found=%t): %w", selectorPath, found, err)
 	}
 
-	// Convert to labels.Selector
-	labelSelector := labels.Set{}
-	for k, v := range selectorData {
-		labelSelector[k] = fmt.Sprintf("%v", v)
-	}
-
-	// Create or update pod informer for this selector
-	av.createPodInformer(poolName, labelSelector.AsSelector())
+	return labels.Set(selectorData).AsSelector(), nil
 }
 
 // createPodInformer creates a new pod informer for the given selector
@@ -321,7 +339,7 @@ func (av *AllowlistValidator) createPodInformer(poolName string, selector labels
 func (av *AllowlistValidator) onPodAdd(obj interface{}) {
 	pod := obj.(*unstructured.Unstructured)
 	podIP, _, _ := unstructured.NestedString(pod.Object, "status", "podIP")
-	av.logger.V(4).Info("Pod added", "name", pod.GetName(), "ip", podIP)
+	av.logger.V(logging.DEBUG).Info("Pod added", "name", pod.GetName(), "ip", podIP)
 	av.rebuildAllowlist()
 }
 
@@ -329,14 +347,14 @@ func (av *AllowlistValidator) onPodAdd(obj interface{}) {
 func (av *AllowlistValidator) onPodUpdate(_, newObj interface{}) {
 	pod := newObj.(*unstructured.Unstructured)
 	podIP, _, _ := unstructured.NestedString(pod.Object, "status", "podIP")
-	av.logger.V(4).Info("Pod updated", "name", pod.GetName(), "ip", podIP)
+	av.logger.V(logging.DEBUG).Info("Pod updated", "name", pod.GetName(), "ip", podIP)
 	av.rebuildAllowlist()
 }
 
 // onPodDelete handles deleted pods
 func (av *AllowlistValidator) onPodDelete(obj interface{}) {
 	pod := obj.(*unstructured.Unstructured)
-	av.logger.V(4).Info("Pod deleted", "name", pod.GetName())
+	av.logger.V(logging.DEBUG).Info("Pod deleted", "name", pod.GetName())
 	av.rebuildAllowlist()
 }
 
@@ -382,5 +400,5 @@ func (av *AllowlistValidator) addPodToAllowlist(pod *unstructured.Unstructured, 
 		av.allowedTargets.Insert(podName)
 	}
 
-	av.logger.V(5).Info("added pod to allowlist", "pod", podName, "ip", podIP, "pool", poolName)
+	av.logger.V(logging.TRACE).Info("added pod to allowlist", "pod", podName, "ip", podIP, "pool", poolName)
 }

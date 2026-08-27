@@ -1,0 +1,266 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package server
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"net"
+	"time"
+
+	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	"github.com/go-logr/logr"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	_ "google.golang.org/grpc/encoding/gzip" // Register gzip compressor for gRPC.
+	"google.golang.org/grpc/health"
+	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+
+	"github.com/llm-d/llm-d-router/internal/runnable"
+	tlsutil "github.com/llm-d/llm-d-router/internal/tls"
+	"github.com/llm-d/llm-d-router/pkg/common"
+	"github.com/llm-d/llm-d-router/pkg/epp/controller"
+	datalayerlogger "github.com/llm-d/llm-d-router/pkg/epp/datalayer/logger"
+	"github.com/llm-d/llm-d-router/pkg/epp/datastore"
+	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts"
+	fwkfc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
+	"github.com/llm-d/llm-d-router/pkg/epp/handlers"
+	"github.com/llm-d/llm-d-router/pkg/epp/metrics"
+	"github.com/llm-d/llm-d-router/pkg/epp/requestcontrol"
+)
+
+// ExtProcServerRunner provides methods to manage an external process server.
+type ExtProcServerRunner struct {
+	GrpcPort int
+	// GrpcListener is an optional pre-bound listener for the ext_proc server.
+	// When set, GrpcPort is ignored. Reserving the port in advance of this
+	// runnable starting closes the window in which another process can take a
+	// port that was selected but not yet bound.
+	GrpcListener                     net.Listener
+	GKNN                             common.GKNN
+	ControllerCfg                    ControllerConfig
+	Datastore                        datastore.Datastore
+	SecureServing                    bool
+	HealthChecking                   bool
+	CertPath                         string
+	EnableCertReload                 bool
+	TLSMinVersion                    uint16
+	TLSCipherSuites                  []uint16
+	RefreshPrometheusMetricsInterval time.Duration
+	MetricsStalenessThreshold        time.Duration
+	Director                         *requestcontrol.Director
+	ParserRegistry                   *handlers.ParserRegistry
+	SaturationDetector               fwkfc.SaturationDetector
+	PriorityBandControlPlane         contracts.PriorityBandControlPlane
+	GRPCMaxRecvMsgSize               int
+	GRPCMaxSendMsgSize               int
+	EnableGRPCStreamMetrics          bool
+	EmitEndpointScores               bool
+
+	// EvictChannelLookup, when set, enables the ext_proc server to terminate in-flight requests
+	// selected for eviction by flow control. See docs/flow-control-eviction.md.
+	EvictChannelLookup handlers.EvictChannelLookup
+}
+
+// NewDefaultExtProcServerRunner creates a runner with default values.
+// Note: Dependencies like Datastore, Scheduler, SD need to be set separately.
+func NewDefaultExtProcServerRunner() *ExtProcServerRunner {
+	opts := NewOptions()
+	if opts.PoolNamespace == "" {
+		opts.PoolNamespace = DefaultPoolNamespace
+	}
+
+	gknn := common.GKNN{
+		NamespacedName: types.NamespacedName{Name: opts.PoolName, Namespace: opts.PoolNamespace},
+		GroupKind: schema.GroupKind{
+			Group: opts.PoolGroup,
+			Kind:  "InferencePool",
+		},
+	}
+	return &ExtProcServerRunner{
+		GrpcPort:           opts.GRPCPort,
+		GRPCMaxRecvMsgSize: opts.GRPCMaxRecvMsgSize,
+		GRPCMaxSendMsgSize: opts.GRPCMaxSendMsgSize,
+		GKNN:               gknn,
+		ControllerCfg: ControllerConfig{
+			startCrdReconcilers:       true,
+			hasInferenceObjective:     true,
+			hasInferenceModelRewrites: true,
+			InferenceObjectiveGV:      inferenceAPIGV,
+			InferenceModelRewriteGV:   inferenceAPIGV,
+		},
+		SecureServing:                    opts.SecureServing,
+		HealthChecking:                   opts.HealthChecking,
+		RefreshPrometheusMetricsInterval: opts.RefreshPrometheusMetricsInterval,
+		MetricsStalenessThreshold:        opts.MetricsStalenessThreshold,
+		// Dependencies can be assigned later.
+	}
+}
+
+// SetupWithManager sets up the runner with the given manager.
+func (r *ExtProcServerRunner) SetupWithManager(mgr ctrl.Manager) error {
+	// Create the controllers and register them with the manager
+	// When PopulateNonLeaderDatastore is set the reconcilers run on every
+	// replica (not just the leader) so non-leaders keep a populated datastore.
+	runOnNonLeaders := r.ControllerCfg.PopulateNonLeaderDatastore
+	if r.ControllerCfg.startCrdReconcilers {
+		if err := (&controller.InferencePoolReconciler{
+			Datastore:       r.Datastore,
+			Reader:          mgr.GetClient(),
+			RunOnNonLeaders: runOnNonLeaders,
+		}).SetupWithManager(mgr); err != nil {
+			return fmt.Errorf("failed setting up InferencePoolReconciler - %w", err)
+		}
+
+		if r.ControllerCfg.hasInferenceObjective {
+			if err := (&controller.InferenceObjectiveReconciler{
+				Datastore:                r.Datastore,
+				Reader:                   mgr.GetClient(),
+				PoolGKNN:                 r.GKNN,
+				PriorityBandControlPlane: r.PriorityBandControlPlane,
+				RunOnNonLeaders:          runOnNonLeaders,
+			}).SetupWithManager(mgr); err != nil {
+				return fmt.Errorf("failed setting up InferenceObjectiveReconciler - %w", err)
+			}
+		}
+		if r.ControllerCfg.hasInferenceModelRewrites {
+			if err := (&controller.InferenceModelRewriteReconciler{
+				Datastore:       r.Datastore,
+				Reader:          mgr.GetClient(),
+				PoolGKNN:        r.GKNN,
+				RunOnNonLeaders: runOnNonLeaders,
+			}).SetupWithManager(mgr); err != nil {
+				return fmt.Errorf("failed setting up InferenceModelRewriteReconciler - %w", err)
+			}
+		}
+	}
+
+	if err := (&controller.PodReconciler{
+		Datastore:       r.Datastore,
+		Reader:          mgr.GetClient(),
+		RunOnNonLeaders: runOnNonLeaders,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("failed setting up PodReconciler - %w", err)
+	}
+	return nil
+}
+
+// AsRunnable returns a Runnable that can be used to start the ext-proc gRPC server.
+// The runnable implements LeaderElectionRunnable with leader election disabled.
+func (r *ExtProcServerRunner) AsRunnable(logger logr.Logger) manager.Runnable {
+	return runnable.NoLeaderElection(manager.RunnableFunc(func(ctx context.Context) error {
+		datalayerlogger.StartMetricsLogger(ctx, r.Datastore, r.RefreshPrometheusMetricsInterval, r.MetricsStalenessThreshold)
+
+		var srv *grpc.Server
+		var creds credentials.TransportCredentials
+		if r.SecureServing {
+			var cert tls.Certificate
+			var err error
+			if r.CertPath != "" {
+				cert, err = tls.LoadX509KeyPair(r.CertPath+"/tls.crt", r.CertPath+"/tls.key")
+			} else {
+				// Create tls based credential.
+				cert, err = tlsutil.CreateSelfSignedTLSCertificate(logger)
+			}
+			if err != nil {
+				return fmt.Errorf("failed to create self signed certificate - %w", err)
+			}
+
+			if r.CertPath != "" && r.EnableCertReload {
+				reloader, err := common.NewCertReloader(ctx, r.CertPath, &cert)
+				if err != nil {
+					return fmt.Errorf("failed to create cert reloader: %w", err)
+				}
+				tlsCfg := &tls.Config{
+					GetCertificate: func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+						return reloader.Get(), nil
+					},
+					NextProtos: []string{"h2"},
+				}
+				r.applyTLSOverrides(tlsCfg)
+				creds = credentials.NewTLS(tlsCfg)
+			} else {
+				tlsCfg := &tls.Config{
+					Certificates: []tls.Certificate{cert},
+					NextProtos:   []string{"h2"},
+				}
+				r.applyTLSOverrides(tlsCfg)
+				creds = credentials.NewTLS(tlsCfg)
+			}
+		}
+
+		var grpcOpts []grpc.ServerOption
+		if creds != nil {
+			grpcOpts = append(grpcOpts, grpc.Creds(creds))
+		}
+		if r.GRPCMaxRecvMsgSize > 0 {
+			grpcOpts = append(grpcOpts, grpc.MaxRecvMsgSize(r.GRPCMaxRecvMsgSize))
+		}
+		if r.GRPCMaxSendMsgSize > 0 {
+			grpcOpts = append(grpcOpts, grpc.MaxSendMsgSize(r.GRPCMaxSendMsgSize))
+		}
+		if r.EnableGRPCStreamMetrics {
+			metrics.RegisterGRPCStreamMetrics()
+			grpcOpts = append(grpcOpts, grpc.ChainStreamInterceptor(streamMetricsInterceptor))
+		}
+		// Note: gzip compressor is registered via blank import above.
+
+		srv = grpc.NewServer(grpcOpts...)
+
+		poolCap := r.GRPCMaxRecvMsgSize
+		if poolCap == 0 {
+			poolCap = 4 * 1024 * 1024 // gRPC default 4MB
+		}
+		extProcServer := handlers.NewStreamingServer(r.Datastore, r.Director, r.ParserRegistry, poolCap)
+		extProcServer.SetEmitEndpointScores(r.EmitEndpointScores)
+		if r.EvictChannelLookup != nil {
+			extProcServer.SetEvictChannelLookup(r.EvictChannelLookup)
+		}
+		extProcPb.RegisterExternalProcessorServer(srv, extProcServer)
+
+		if r.HealthChecking {
+			healthcheck := health.NewServer()
+			healthgrpc.RegisterHealthServer(srv,
+				healthcheck,
+			)
+			svcName := extProcPb.ExternalProcessor_ServiceDesc.ServiceName
+			logger.Info("Setting ExternalProcessor service status to SERVING", "serviceName", svcName)
+			healthcheck.SetServingStatus(svcName, healthgrpc.HealthCheckResponse_SERVING)
+		}
+
+		// Forward to the gRPC runnable.
+		if r.GrpcListener != nil {
+			return runnable.GRPCServerOnListener("ext-proc", srv, r.GrpcListener).Start(ctx)
+		}
+		return runnable.GRPCServer("ext-proc", srv, r.GrpcPort).Start(ctx)
+	}))
+}
+
+// applyTLSOverrides sets MinVersion and CipherSuites on cfg when configured.
+func (r *ExtProcServerRunner) applyTLSOverrides(cfg *tls.Config) {
+	if r.TLSMinVersion != 0 {
+		cfg.MinVersion = r.TLSMinVersion
+	}
+	if len(r.TLSCipherSuites) > 0 {
+		cfg.CipherSuites = r.TLSCipherSuites
+	}
+}

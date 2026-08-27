@@ -1,367 +1,519 @@
-# The Go and Python based tools are defined in Makefile.tools.mk.
-include Makefile.tools.mk
-
 SHELL := /usr/bin/env bash
 
+LOCALBIN ?= $(shell pwd)/bin
+HELM ?= $(LOCALBIN)/helm
+KUBECTL_VALIDATE ?= $(LOCALBIN)/kubectl-validate
+YQ ?= $(LOCALBIN)/yq
+
+# Tool checks (container runtime, kubectl, etc.) are defined in Makefile.tools.mk.
+include Makefile.tools.mk
+# Cluster (Kubernetes/OpenShift) specific targets are defined in Makefile.cluster.mk.
+include Makefile.cluster.mk
+# Kind specific targets are defined in Makefile.kind.mk.
+include Makefile.kind.mk
+# Code generation targets are defined in Makefile.gen.mk
+include Makefile.gen.mk
+
 # Defaults
-TARGETOS ?= $(shell go env GOOS)
-TARGETARCH ?= $(shell go env GOARCH)
-PROJECT_NAME ?= llm-d-inference-scheduler
-SIDECAR_IMAGE_NAME ?= llm-d-routing-sidecar
+TARGETOS ?= $(shell command -v go >/dev/null 2>&1 && go env GOOS || uname -s | tr '[:upper:]' '[:lower:]')
+TARGETARCH ?= $(shell command -v go >/dev/null 2>&1 && go env GOARCH || uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/; s/armv7l/arm/')
+PROJECT_NAME ?= llm-d-router
+EPP_IMAGE_NAME ?= llm-d-router-endpoint-picker
+SIDECAR_IMAGE_NAME ?= llm-d-router-disagg-sidecar
+VLLM_SIMULATOR_IMAGE_NAME ?= llm-d-inference-sim
 SIDECAR_NAME ?= pd-sidecar
+BUILDER_IMAGE_NAME ?= llm-d-builder
 IMAGE_REGISTRY ?= ghcr.io/llm-d
-IMAGE_TAG_BASE ?= $(IMAGE_REGISTRY)/$(PROJECT_NAME)
+
+EPP_IMAGE_TAG_BASE ?= $(IMAGE_REGISTRY)/$(EPP_IMAGE_NAME)
 EPP_TAG ?= dev
-export EPP_TAG
-IMG = $(IMAGE_TAG_BASE):$(EPP_TAG)
-SIDECAR_TAG ?= dev
-export SIDECAR_TAG
+export EPP_IMAGE ?= $(EPP_IMAGE_TAG_BASE):$(EPP_TAG)
+
 SIDECAR_IMAGE_TAG_BASE ?= $(IMAGE_REGISTRY)/$(SIDECAR_IMAGE_NAME)
-SIDECAR_IMG = $(SIDECAR_IMAGE_TAG_BASE):$(SIDECAR_TAG)
+SIDECAR_TAG ?= dev
+export SIDECAR_IMAGE ?= $(SIDECAR_IMAGE_TAG_BASE):$(SIDECAR_TAG)
+
+VLLM_SIMULATOR_TAG ?= v0.10.2
+VLLM_SIMULATOR_TAG_BASE ?= $(IMAGE_REGISTRY)/$(VLLM_SIMULATOR_IMAGE_NAME)
+export VLLM_IMAGE ?= $(VLLM_SIMULATOR_TAG_BASE):$(VLLM_SIMULATOR_TAG)
+
+# CPU-only vLLM image that exposes `vllm launch render` for the token-producer
+# plugin's HTTP backend.
+export VLLM_RENDER_IMAGE ?= vllm/vllm-openai-cpu:v0.21.0
+export VLLM_RENDER_PORT ?= 8082
+export VLLM_RENDER_URL ?= http://vllm-render:$(VLLM_RENDER_PORT)
+
+BUILDER_TAG ?= dev
+BUILDER_TAG_BASE ?= $(IMAGE_REGISTRY)/$(BUILDER_IMAGE_NAME)
+export BUILDER_IMAGE ?= $(BUILDER_TAG_BASE):$(BUILDER_TAG)
+
 NAMESPACE ?= hc4ai-operator
-VLLM_SIMULATOR_TAG ?= v0.5.0
-export VLLM_SIMULATOR_TAG
+LINT_NEW_ONLY ?= false # Set to true to only lint new code, false to lint all code (default matches CI behavior)
 
-# Map go arch to typos arch
-ifeq ($(TARGETARCH),amd64)
-TYPOS_TARGET_ARCH = x86_64
-else ifeq ($(TARGETARCH),arm64)
-TYPOS_TARGET_ARCH = aarch64
-else
-TYPOS_TARGET_ARCH = $(TARGETARCH)
-endif
-
-ifeq ($(TARGETOS),darwin)
-ifeq ($(TARGETARCH),amd64)
-TOKENIZER_ARCH = x86_64
-else
-TOKENIZER_ARCH = $(TARGETARCH)
-endif
-TAR_OPTS = --strip-components 1
-TYPOS_ARCH = $(TYPOS_TARGET_ARCH)-apple-darwin
-else
-TOKENIZER_ARCH = $(TARGETARCH)
-TAR_OPTS = --wildcards '*/typos'
-TYPOS_ARCH = $(TYPOS_TARGET_ARCH)-unknown-linux-musl
-endif
-
-CONTAINER_RUNTIME := $(shell { command -v docker >/dev/null 2>&1 && echo docker; } || { command -v podman >/dev/null 2>&1 && echo podman; } || echo "")
+CONTAINER_RUNTIME ?= $(shell { command -v docker >/dev/null 2>&1 && echo docker; } || { command -v podman >/dev/null 2>&1 && echo podman; } || echo "")
 export CONTAINER_RUNTIME
-BUILDER := $(shell command -v buildah >/dev/null 2>&1 && echo buildah || echo $(CONTAINER_RUNTIME))
-PLATFORMS ?= linux/amd64 # linux/arm64 # linux/s390x,linux/ppc64le
 
-GIT_COMMIT_SHA ?= "$(shell git rev-parse HEAD 2>/dev/null)"
-BUILD_REF ?= $(shell git describe --abbrev=0 2>/dev/null)
+GIT_COMMIT_SHA ?= $(shell git rev-parse HEAD 2>/dev/null)
+# Match only root-level release tags (v[0-9]*) so submodule tags don't leak into image versions.
+ROOT_RELEASE_TAG_MATCH ?= v[0-9]*
+BUILD_REF ?= $(shell git describe --tags --match '$(ROOT_RELEASE_TAG_MATCH)' --abbrev=0 2>/dev/null)
+LATENCY_PREDICTOR_TAG ?= $(or $(EXTRA_TAG),$(BUILD_REF),latest)
 
-# go source files
-SRC = $(shell find . -type f -name '*.go')
+# Host directories for Go module and build caches, bind-mounted into the builder container.
+GO_MOD_CACHE_VOL ?= $(HOME)/.cache/llm-d-gomodcache
+GO_BUILD_CACHE_VOL ?= $(HOME)/.cache/llm-d-gobuildcache
+
+# Common flags for running the builder container: mounts source, Go caches, and runs as current user.
+# Podman rootless requires --userns=keep-id to correctly map host UID; docker uses -u directly.
+# Rootful Podman (e.g. Podman machine on macOS) does not support --userns=keep-id with --network=host.
+ifeq ($(CONTAINER_RUNTIME),podman)
+PODMAN_ROOTLESS := $(shell podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)
+ifeq ($(PODMAN_ROOTLESS),true)
+BUILDER_USER_FLAGS = --userns=keep-id
+else
+BUILDER_USER_FLAGS =
+endif
+else
+BUILDER_USER_FLAGS = -u $$(id -u):$$(id -g)
+endif
+
+BUILDER_RUN_FLAGS = --rm $(BUILDER_USER_FLAGS) \
+	-v $$(pwd):/app:Z -w /app \
+	-v $(GO_MOD_CACHE_VOL):/go/pkg/mod:z \
+	-v $(GO_BUILD_CACHE_VOL):/go/cache:z
+
+# Respect host KUBECONFIG if set; fall back to ~/.kube/config.
+# Note: if KUBECONFIG is a colon-separated list, only the first file is mounted.
+HOST_KUBECONFIG ?= $(or $(KUBECONFIG),$(HOME)/.kube/config)
+
+# Flags for targets that need host network and kubeconfig (integration tests, benchmarks).
+BUILDER_CLUSTER_FLAGS = --network=host \
+	-v $(HOST_KUBECONFIG):/.kube/config:ro \
+	-e KUBECONFIG=/.kube/config
+
+# Mount the container runtime socket and set CONTAINER_HOST so podman --remote
+# inside the builder can talk to the host's container runtime.
+ifeq ($(CONTAINER_RUNTIME),podman)
+CONTAINER_SOCK ?= $(or $(shell podman info --format '{{.Host.RemoteSocket.Path}}' 2>/dev/null | sed 's|^unix://||'),/run/podman/podman.sock)
+BUILDER_SOCK_FLAGS = --security-opt label=disable \
+	-v $(CONTAINER_SOCK):$(CONTAINER_SOCK) \
+	-e CONTAINER_HOST=unix://$(CONTAINER_SOCK) \
+	-e DOCKER_HOST=unix://$(CONTAINER_SOCK) \
+	-e CONTAINER_RUNTIME=podman \
+	-e KIND_EXPERIMENTAL_PROVIDER=podman
+else
+CONTAINER_SOCK ?= /var/run/docker.sock
+ifeq ($(TARGETOS),darwin)
+DOCKER_SOCK_GID := $(shell stat -f '%g' $(CONTAINER_SOCK) 2>/dev/null)
+else
+DOCKER_SOCK_GID := $(shell stat -c '%g' $(CONTAINER_SOCK) 2>/dev/null)
+endif
+ifneq ($(DOCKER_SOCK_GID),)
+DOCKER_GROUP_PARAM := --group-add $(DOCKER_SOCK_GID)
+else
+DOCKER_GROUP_PARAM :=
+endif
+BUILDER_SOCK_FLAGS = $(DOCKER_GROUP_PARAM) \
+	-v $(CONTAINER_SOCK):$(CONTAINER_SOCK) \
+	-e DOCKER_HOST=unix://$(CONTAINER_SOCK) \
+	-e CONTAINER_RUNTIME=docker
+endif
+
+E2E_NUM_PROCS ?= 5
+
+# Env vars forwarded into the e2e test container.
+# Add new image vars here so they are automatically passed through.
+# Should we pass ALL env vars here?
+E2E_ENV_VARS = EPP_IMAGE VLLM_IMAGE SIDECAR_IMAGE VLLM_RENDER_IMAGE \
+               E2E_KEEP_CLUSTER_ON_FAILURE E2E_PORT E2E_METRICS_PORT K8S_CONTEXT READY_TIMEOUT \
+               EXISTS_TIMEOUT E2E_NUM_PROCS LOAD_VLLM_RENDER_IMAGE HF_TOKEN
+BUILDER_E2E_ENV_FLAGS = $(foreach v,$(E2E_ENV_VARS),$(if $($(v)),-e '$(v)=$($(v))'))
+ifneq ($(filter command line environment,$(origin NAMESPACE)),)
+BUILDER_E2E_ENV_FLAGS += -e NAMESPACE=$(NAMESPACE)
+endif
+
+# When K8S_CONTEXT is set, mount the host kubeconfig so the e2e suite can call
+# config.GetConfigWithContext(K8S_CONTEXT) against an existing cluster instead of
+# creating a new kind cluster.
+ifdef K8S_CONTEXT
+BUILDER_E2E_KUBECONFIG_FLAGS = -v $(HOST_KUBECONFIG):/.kube/config:ro -e KUBECONFIG=/.kube/config
+else
+BUILDER_E2E_KUBECONFIG_FLAGS =
+endif
+
+# E2e tests create their own kind cluster, need host network (for NodePort access)
+# and the container socket (for kind), but not the host kubeconfig.
+BUILDER_E2E_FLAGS = --network=host $(BUILDER_SOCK_FLAGS) $(BUILDER_E2E_ENV_FLAGS) $(BUILDER_E2E_KUBECONFIG_FLAGS)
+
+# Builder container invocations. Always use sh -c so commands with shell expansions
+# (pipes, $(), etc.) run inside the container, not on the host.
+BUILDER_RUN = $(CONTAINER_RUNTIME) run $(BUILDER_RUN_FLAGS) $(BUILDER_IMAGE) sh -c
+BUILDER_RUN_CLUSTER = $(CONTAINER_RUNTIME) run $(BUILDER_RUN_FLAGS) $(BUILDER_CLUSTER_FLAGS) $(BUILDER_IMAGE) sh -c
+
+# Linker flags for go build inside Docker images.
+# Default strips debug symbols for smaller production images.
+# Override locally to build a debuggable image: LDFLAGS="" make image-build-epp
+LDFLAGS ?= -s -w
+
+# Optional: override the runtime base image used in container builds.
+# When set, passed as --build-arg BASE_IMAGE=<value> to the container build.
+# Example: BASE_IMAGE=registry.access.redhat.com/ubi9/ubi-micro:9.7 make image-build-epp
+BASE_IMAGE ?=
+
+# test packages
+epp_TEST_PACKAGES = $$(go list ./... | grep -v /test/ | grep -v ./pkg/sidecar/ | grep -v ./pkg/coordinator/ | grep -v ./cmd/coordinator | tr '\n' ' ')
+sidecar_TEST_PACKAGES = ./pkg/sidecar/...
+# framework is intentionally absent from the worktree coverage-compare baseline
+# block (epp+sidecar only); CI's baseline cache unions all coverage/*.out, so
+# framework enters the CI baseline once this is on main. The PR run reports
+# coverage/framework.out as a new component.
+framework_TEST_PACKAGES = ./test/framework/...
 
 # Internal variables for generic targets
-epp_IMAGE = $(IMG)
-sidecar_IMAGE = $(SIDECAR_IMG)
+epp_IMAGE = $(EPP_IMAGE)
+sidecar_IMAGE = $(SIDECAR_IMAGE)
 epp_NAME = epp
 sidecar_NAME = $(SIDECAR_NAME)
-epp_LDFLAGS = -ldflags="$(LDFLAGS)"
-sidecar_LDFLAGS =
-epp_TEST_FILES = go list ./... | grep -v /test/ | grep -v ./pkg/sidecar/
-sidecar_TEST_FILES = go list ./pkg/sidecar/...
+
 
 .PHONY: help
 help: ## Print help
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
-##@ Tokenizer & Linking
-
-LDFLAGS ?= -extldflags '-L$(shell pwd)/lib'
-CGO_ENABLED=1
-TOKENIZER_LIB = lib/libtokenizers.a
-# Extract RELEASE_VERSION from Dockerfile
-TOKENIZER_VERSION := $(shell grep '^ARG RELEASE_VERSION=' Dockerfile.epp | cut -d'=' -f2)
-
-.PHONY: download-tokenizer
-download-tokenizer: $(TOKENIZER_LIB)
-$(TOKENIZER_LIB):
-	## Download the HuggingFace tokenizer bindings.
-	@echo "Downloading HuggingFace tokenizer bindings for version $(TOKENIZER_VERSION)..."
-	mkdir -p lib
-	curl -L https://github.com/daulet/tokenizers/releases/download/$(TOKENIZER_VERSION)/libtokenizers.$(TARGETOS)-$(TOKENIZER_ARCH).tar.gz | tar -xz -C lib
-	ranlib lib/*.a
-
 ##@ Development
 
+.PHONY: builder-shell
+builder-shell: image-build-builder ## Open a shell in the builder container
+	$(CONTAINER_RUNTIME) run -it $(BUILDER_RUN_FLAGS) $(BUILDER_IMAGE) bash
+
+.PHONY: builder-cluster-shell
+builder-cluster-shell: image-build-builder ## Open a shell with cluster access
+	$(CONTAINER_RUNTIME) run -it $(BUILDER_RUN_FLAGS) $(BUILDER_CLUSTER_FLAGS) $(BUILDER_IMAGE) bash
+
+.PHONY: builder-e2e-shell
+builder-e2e-shell: image-build-builder ## Open a shell with e2e test access
+	$(CONTAINER_RUNTIME) run -it $(BUILDER_RUN_FLAGS) $(BUILDER_E2E_FLAGS) $(BUILDER_IMAGE) bash
+
+.PHONY: install-hooks
+install-hooks: ## Install git hooks
+	git config core.hooksPath hooks
+
+.PHONY: upgrade-deps
+upgrade-deps: ## Upgrade all Go dependencies to latest minor/patch versions and tidy; review diff before committing
+	go get -u ./...
+	go mod tidy
+
+.PHONY: vulncheck
+vulncheck: image-build-builder ## Run govulncheck for known vulnerabilities
+	@printf "\033[33;1m==== Running govulncheck ====\033[0m\n"
+	$(BUILDER_RUN) 'govulncheck ./...'
+
+.PHONY: check-latest-tags
+check-latest-tags: ## Check ':latest' image tags in YAML (warn-only; use check-latest-tags-strict to fail)
+	@./scripts/check-latest-tags.sh --warn
+
+.PHONY: check-latest-tags-strict
+check-latest-tags-strict: ## Check ':latest' image tags in YAML (strict; fails on any violation)
+	@./scripts/check-latest-tags.sh
+
+.PHONY: presubmit
+presubmit: LINT_NEW_ONLY=true
+presubmit: git-branch-check signed-commits-check go-mod-check format lint vulncheck check-latest-tags-strict
+
+.PHONY: git-branch-check
+git-branch-check:
+	@branch=$$(git rev-parse --abbrev-ref HEAD); \
+	if [ "$$branch" = "main" ]; then \
+		echo "ERROR: Direct push to 'main' is not allowed."; \
+		echo "Create a branch and open a PR instead."; \
+		exit 1; \
+	fi
+
+.PHONY: signed-commits-check
+signed-commits-check:
+	@./scripts/check-commits.sh upstream/main
+
+.PHONY: go-mod-check
+go-mod-check: image-build-builder
+	@echo "Checking go.mod/go.sum are clean..."
+	$(BUILDER_RUN) 'go mod tidy'
+	@git diff --exit-code go.mod go.sum || \
+	( echo "ERROR: go.mod/go.sum are not tidy. Run 'go mod tidy' and commit."; exit 1 )
+
+.PHONY: tidy
+tidy:
+	go mod tidy
+
 .PHONY: clean
-clean:
-	go clean -testcache -cache
-	rm -f $(TOKENIZER_LIB)
-	rmdir lib
+clean: ## Clean build artifacts, tools and caches
+	rm -rf bin build $(BUILDER_STAMP)
+	-$(BUILDER_RUN) 'go clean -testcache -cache'
 
 .PHONY: format
-format: ## Format Go source files
-	@printf "\033[33;1m==== Running gofmt ====\033[0m\n"
-	@gofmt -l -w $(SRC)
+format: image-build-builder ## Format Go source files
+	@printf "\033[33;1m==== Running go fmt ====\033[0m\n"
+	$(BUILDER_RUN) 'gofmt -l -w . && golangci-lint fmt --config=./.golangci.yml'
+
+.PHONY: lint
+lint: image-build-builder ## Run lint (use LINT_NEW_ONLY=true to only check new code)
+	$(eval LINT_ARGS := --config=./.golangci.yml$(if $(filter true,$(LINT_NEW_ONLY)), --new))
+	@printf "\033[33;1m==== Running linting ====\033[0m\n"
+	$(BUILDER_RUN) 'GOFLAGS=-buildvcs=false golangci-lint run $(LINT_ARGS) && typos'
+
+# Reports findings without failing while the initial baseline is triaged.
+# Set to 1 to block merges on new findings.
+SECURITY_LINT_EXIT_CODE ?= 0
+
+.PHONY: lint-security
+lint-security: image-build-builder ## Run security linters and write gosec.sarif
+	@printf "\033[33;1m==== Running security linting ====\033[0m\n"
+	$(BUILDER_RUN) 'GOFLAGS=-buildvcs=false golangci-lint run --config=./.golangci-security.yml --issues-exit-code=$(SECURITY_LINT_EXIT_CODE)'
 
 .PHONY: test
-test: test-unit test-e2e ## Run unit tests and e2e tests
+test: test-unit test-e2e ## Run all tests (unit and e2e)
 
 .PHONY: test-unit
-test-unit: test-unit-epp test-unit-sidecar
+test-unit: test-unit-epp test-unit-sidecar test-unit-framework ## Run unit tests
 
 .PHONY: test-unit-%
-test-unit-%: download-tokenizer install-dependencies ## Run unit tests
-	@printf "\033[33;1m==== Running Unit Tests ====\033[0m\n"
-	go test $($*_LDFLAGS) -cover -coverprofile=coverage-$*.out -v $$($($*_TEST_FILES) | tr '\n' ' ')
+test-unit-%: image-build-builder
+	@mkdir -p $(COVERAGE_DIR)
+	@printf "\033[33;1m==== Running $* Unit Tests ====\033[0m\n"
+	$(BUILDER_RUN) "go test -v -race -coverprofile=$(COVERAGE_DIR)/$*.out -covermode=atomic $($*_TEST_PACKAGES)"
+	$(BUILDER_RUN) 'go tool cover -func=$(COVERAGE_DIR)/$*.out | tail -1'
+
+.PHONY: test-filter
+test-filter: image-build-builder ## Run filtered unit tests (usage: make test-filter PATTERN=TestName TYPE=epp)
+	@if [ -z "$(PATTERN)" ]; then \
+		echo "ERROR: PATTERN is required. Usage: make test-filter PATTERN=TestName [TYPE=epp|sidecar]"; \
+		exit 1; \
+	fi
+	@TEST_TYPE="$(if $(TYPE),$(TYPE),epp)"; \
+	printf "\033[33;1m==== Running Filtered Tests (pattern: $(PATTERN), type: $$TEST_TYPE) ====\033[0m\n"; \
+	if [ "$$TEST_TYPE" = "epp" ]; then \
+		$(BUILDER_RUN) "go test -v -run \"$(PATTERN)\" $(epp_TEST_PACKAGES)"; \
+	else \
+		$(BUILDER_RUN) "go test -v -run \"$(PATTERN)\" $(sidecar_TEST_PACKAGES)"; \
+	fi
 
 .PHONY: test-integration
-test-integration: download-tokenizer install-dependencies ## Run integration tests
+test-integration: image-build-builder ## Run integration tests (requires KUBECONFIG and running cluster)
+	@mkdir -p $(COVERAGE_DIR)
 	@printf "\033[33;1m==== Running Integration Tests ====\033[0m\n"
-	go test -ldflags="$(LDFLAGS)" -v -tags=integration_tests ./test/integration/
+	$(BUILDER_RUN_CLUSTER) 'go test -v -race -tags=integration_tests -coverprofile=$(COVERAGE_DIR)/integration.out -covermode=atomic ./test/integration/'
+	$(BUILDER_RUN) 'go tool cover -func=$(COVERAGE_DIR)/integration.out | tail -1'
+
+.PHONY: test-integration-hermetic
+test-integration-hermetic: image-build-builder ## Run hermetic integration tests (envtest, no cluster required)
+	@mkdir -p $(COVERAGE_DIR)
+	@printf "\033[33;1m==== Running Hermetic Integration Tests ====\033[0m\n"
+	$(BUILDER_RUN) 'CGO_ENABLED=1 KUBEBUILDER_ASSETS="$$(setup-envtest use $$ENVTEST_K8S_VERSION --bin-dir $$ENVTEST_ASSETS_DIR -p path)" go test -v -race $(if $(PATTERN),-run "$(PATTERN)",) -coverprofile=$(COVERAGE_DIR)/integration-hermetic.out -covermode=atomic ./test/integration/...'
+	$(BUILDER_RUN) 'go tool cover -func=$(COVERAGE_DIR)/integration-hermetic.out | tail -1'
+
+
+.PHONY: test-e2e-run
+test-e2e-run: image-pull ## Ensure images are present, then run e2e tests
+	@printf "\033[33;1m==== Running End to End Tests ====\033[0m\n"
+	$(CONTAINER_RUNTIME) run $(BUILDER_RUN_FLAGS) $(BUILDER_E2E_FLAGS) \
+		$(BUILDER_IMAGE) ./test/scripts/test-e2e-router.sh
 
 .PHONY: test-e2e
-test-e2e: image-build image-pull ## Run end-to-end tests against a new kind cluster
-	@printf "\033[33;1m==== Running End to End Tests ====\033[0m\n"
-	./test/scripts/run_e2e.sh
+test-e2e: image-build-builder image-build ## Build images and run e2e tests
+	$(MAKE) test-e2e-run
+
+
+.PHONY: bench-tokenizer
+bench-tokenizer: image-build-builder ## Run tokenizer + scorer benchmark (requires kind cluster with EPP deployed)
+	@printf "\033[33;1m==== Running Tokenizer Benchmark ====\033[0m\n"
+	@printf "Ensure the kind cluster is running with the KV cache config.\n"
+	@printf "Run 'KV_CACHE_ENABLED=true make env-dev-kind' first.\n\n"
+	$(BUILDER_RUN_CLUSTER) 'go test -bench=. -benchmem -count=5 -timeout=5m ./test/profiling/tokenizerbench/'
+
+.PHONY: bench-smoke
+bench-smoke: image-build-builder ## Smoke-run the flowcontrol benchmarks once (-benchtime=1x) to catch runtime rot
+	@printf "\033[33;1m==== Running Flow Control Benchmark Smoke ====\033[0m\n"
+	$(BUILDER_RUN) 'go test -run=^$$ -bench=. -benchtime=1x -timeout=5m ./pkg/epp/flowcontrol/benchmark/...'
 
 .PHONY: post-deploy-test
 post-deploy-test: ## Run post deployment tests
-	echo Success!
+	@echo "Success!"
 	@echo "Post-deployment tests passed."
 
-.PHONY: lint
-lint: check-golangci-lint check-typos ## Run lint
-	@printf "\033[33;1m==== Running linting ====\033[0m\n"
-	golangci-lint run
-	$(TYPOS)
+.PHONY: verify-manifests
+verify-manifests: kubectl-validate ## Validate deployment manifests.
+	KUBECTL_VALIDATE="$(KUBECTL_VALIDATE)" hack/verify-manifests.sh
+
+##@ Helm
+
+.PHONY: verify-helm-charts
+verify-helm-charts: helm-install kubectl-validate ## Render and validate Helm charts.
+	HELM="$(HELM)" KUBECTL_VALIDATE="$(KUBECTL_VALIDATE)" hack/verify-helm.sh $(MODE)
+
+.PHONY: helm-push
+helm-push: yq helm-install ## Package and push a specified Helm chart. Usage: make helm-push CHART=<chart_name>
+	@if [ -z "$(CHART)" ]; then echo "Error: CHART variable is required (e.g. CHART=llm-d-router-standalone)"; exit 1; fi
+	CHART=$(CHART) EXTRA_TAG="$(EXTRA_TAG)" CHART_SUFFIX="$(CHART_SUFFIX)" EPP_RELEASE_IMAGE_REPOSITORY="$(EPP_RELEASE_IMAGE_REPOSITORY)" LATENCY_PREDICTOR_TAG="$(LATENCY_PREDICTOR_TAG)" YQ="$(YQ)" HELM="$(HELM)" ./hack/push-chart.sh
+
+.PHONY: helm-push-gateway
+helm-push-gateway: ## Package and push the llm-d-router-gateway Helm chart.
+	$(MAKE) helm-push CHART=llm-d-router-gateway
+
+.PHONY: helm-push-standalone
+helm-push-standalone: ## Package and push the llm-d-router-standalone Helm chart.
+	$(MAKE) helm-push CHART=llm-d-router-standalone
+
+
+##@ Release
+
+BUNDLE_VERSION ?= main-dev
+export BUNDLE_VERSION
+
+.PHONY: artifacts
+artifacts: generate yq check-kustomize ## Generate release artifacts (CRD manifests).
+	if [ -d artifacts ]; then rm -rf artifacts; fi
+	mkdir -p artifacts
+	kubectl kustomize config/crd > artifacts/manifests_all.yaml
+	$(YQ) -P 'select(.spec.group == "llm-d.ai")' artifacts/manifests_all.yaml > artifacts/manifests.yaml
+	rm -f artifacts/manifests_all.yaml
+	$(YQ) -P 'select(.spec.versions | map(.name == "v1") | any)' artifacts/manifests.yaml > artifacts/v1-manifests.yaml
+	$(YQ) -P 'select(.spec.versions | map(.name != "v1") | all)' artifacts/manifests.yaml > artifacts/experimental-manifests.yaml
+
+
+##@ Coverage
+
+COVERAGE_DIR       ?= coverage
+COVERAGE_THRESHOLD ?= 0
+COVERAGE_LABEL     ?= main
+BASE_REF           ?= main
+
+.PHONY: test-coverage
+test-coverage: test-unit ## Run all unit tests with coverage (alias for test-unit)
+
+.PHONY: test-coverage-integration
+test-coverage-integration: test-integration ## Run integration tests with coverage (alias for test-integration)
+
+.PHONY: coverage-report
+coverage-report: image-build-builder ## Generate HTML coverage reports (open coverage/*.html in browser)
+	$(BUILDER_RUN) 'for f in $(COVERAGE_DIR)/*.out; do \
+	    name=$$(basename "$$f" .out); \
+	    go tool cover -html="$$f" -o "$(COVERAGE_DIR)/$$name.html"; \
+	    printf "  $$name → $(COVERAGE_DIR)/$$name.html\n"; \
+	done'
+
+.PHONY: coverage-compare
+coverage-compare: image-build-builder ## Compare coverage vs baseline (BASELINE_DIR=path or BASE_REF=git-ref, default main; COVERAGE_LABEL=label)
+	@if [ -n "$(BASELINE_DIR)" ]; then \
+	    ./scripts/compare-coverage.sh "$(BASELINE_DIR)" "$(COVERAGE_DIR)" "$(COVERAGE_THRESHOLD)" "$(COVERAGE_LABEL)"; \
+	else \
+	    printf "\033[33;1m==== Building Baseline Coverage from $(BASE_REF) ====\033[0m\n"; \
+	    EXISTING=$$(git worktree list --porcelain \
+	        | awk '/^worktree /{wt=$$2} /^branch refs\/heads\/$(BASE_REF)$$/{print wt}'); \
+	    if [ -n "$$EXISTING" ]; then \
+	        WORKTREE="$$EXISTING"; CLEANUP=0; \
+	    else \
+	        WORKTREE=$$(mktemp -u /tmp/cov-baseline-XXXXXX); \
+	        git worktree add --quiet "$$WORKTREE" "$(BASE_REF)"; \
+	        CLEANUP=1; \
+	    fi; \
+	    mkdir -p "$(COVERAGE_DIR)/baseline"; \
+	    $(CONTAINER_RUNTIME) run $(BUILDER_RUN_FLAGS) \
+	        -v "$$WORKTREE":/baseline:Z \
+	        $(BUILDER_IMAGE) sh -c " \
+	            cd /baseline && \
+	            go test -race -coverprofile=/app/$(COVERAGE_DIR)/baseline/epp.out -covermode=atomic \
+	                $$(go list ./... | grep -v /test/ | grep -v ./pkg/sidecar/ | tr '\n' ' ') && \
+	            go test -race -coverprofile=/app/$(COVERAGE_DIR)/baseline/sidecar.out -covermode=atomic \
+	                ./pkg/sidecar/..."; \
+	    [ "$$CLEANUP" -eq 1 ] && git worktree remove --force "$$WORKTREE"; \
+	    ./scripts/compare-coverage.sh "$(COVERAGE_DIR)/baseline" "$(COVERAGE_DIR)" "$(COVERAGE_THRESHOLD)" "$(COVERAGE_LABEL)"; \
+	fi
+
 
 ##@ Build
 
 .PHONY: build
-build: build-epp build-sidecar ## Build the project
+build: build-epp build-sidecar ## Build the project for both epp and sidecar
 
 .PHONY: build-%
-build-%: check-go install-dependencies download-tokenizer ## Build the project
-	@printf "\033[33;1m==== Building ====\033[0m\n"
-	go build $($*_LDFLAGS) -o bin/$($*_NAME) cmd/$($*_NAME)/main.go
+build-%: image-build-builder ## Build the project
+	@printf "\033[33;1m==== Building $* ====\033[0m\n"
+	$(BUILDER_RUN) 'go build -o bin/$($*_NAME) cmd/$($*_NAME)/main.go'
 
-##@ Container Build/Push
+##@ Container image Build/Push/Pull
 
 .PHONY:	image-build
-image-build: image-build-epp image-build-sidecar ## Build Docker image
+image-build: image-build-epp image-build-sidecar ## Build Container image using $(CONTAINER_RUNTIME)
 
 .PHONY: image-build-%
-image-build-%: check-container-tool ## Build Docker image ## Build Docker image using $(CONTAINER_RUNTIME)
+image-build-%: check-container-tool ## Build Container image using $(CONTAINER_RUNTIME)
 	@printf "\033[33;1m==== Building Docker image $($*_IMAGE) ====\033[0m\n"
 	$(CONTAINER_RUNTIME) build \
 		--platform linux/$(TARGETARCH) \
- 		--build-arg TARGETOS=linux \
+		--build-arg TARGETOS=linux \
 		--build-arg TARGETARCH=$(TARGETARCH) \
 		--build-arg COMMIT_SHA=${GIT_COMMIT_SHA} \
 		--build-arg BUILD_REF=${BUILD_REF} \
- 		-t $($*_IMAGE) -f Dockerfile.$* .
+		--build-arg LDFLAGS="$(LDFLAGS)" \
+		$(if $(BASE_IMAGE),--build-arg BASE_IMAGE="$(BASE_IMAGE)") \
+		-t $($*_IMAGE) -f Dockerfile.$* .
+
+BUILDER_STAMP = build/.builder.stamp
+
+.PHONY: image-build-builder
+image-build-builder: check-container-tool ## Build builder image if missing locally, stamp missing, or Dockerfile.builder newer than stamp
+	@mkdir -p $(GO_MOD_CACHE_VOL) $(GO_BUILD_CACHE_VOL)
+	@if ! $(CONTAINER_RUNTIME) image inspect $(BUILDER_IMAGE) >/dev/null 2>&1 || \
+	    [ ! -f $(BUILDER_STAMP) ] || \
+	    [ Dockerfile.builder -nt $(BUILDER_STAMP) ]; then \
+		printf "\033[33;1m==== Building image $(BUILDER_IMAGE) ====\033[0m\n"; \
+		$(CONTAINER_RUNTIME) build -f Dockerfile.builder -t $(BUILDER_IMAGE) .; \
+		mkdir -p $(dir $(BUILDER_STAMP)); \
+		touch $(BUILDER_STAMP); \
+	fi
 
 .PHONY: image-push
-image-push: image-push-epp image-push-sidecar ## Push container images to registry
+image-push: image-push-epp image-push-sidecar ## Push container images to registry using $(CONTAINER_RUNTIME)
 
 .PHONY: image-push-%
-image-push-%: check-container-tool ## Push container image to registry
+image-push-%: check-container-tool ## Push container image to registry using $(CONTAINER_RUNTIME)
 	@printf "\033[33;1m==== Pushing Container image $($*_IMAGE) ====\033[0m\n"
 	$(CONTAINER_RUNTIME) push $($*_IMAGE)
 
 .PHONY: image-pull
 image-pull: check-container-tool ## Pull all related images using $(CONTAINER_RUNTIME)
 	@printf "\033[33;1m==== Pulling Container images ====\033[0m\n"
-	./scripts/pull_images.sh
+	TARGETARCH=$(TARGETARCH) ./scripts/pull_images.sh
 
-##@ Install/Uninstall Targets
+##@ Container Run
 
-# Default install/uninstall (Docker)
-install: install-docker ## Default install using Docker
-	@echo "Default Docker install complete."
-
-uninstall: uninstall-docker ## Default uninstall using Docker
-	@echo "Default Docker uninstall complete."
-
-### Docker Targets
-
-.PHONY: install-docker
-install-docker: check-container-tool ## Install app using $(CONTAINER_RUNTIME)
+.PHONY: run-container
+run-container: check-container-tool ## Run app in container using $(CONTAINER_RUNTIME)
 	@echo "Starting container with $(CONTAINER_RUNTIME)..."
-	$(CONTAINER_RUNTIME) run -d --name $(PROJECT_NAME)-container $(IMG)
-	@echo "$(CONTAINER_RUNTIME) installation complete."
+	$(CONTAINER_RUNTIME) run -d --name $(PROJECT_NAME)-container $(EPP_IMAGE)
+	@echo "$(CONTAINER_RUNTIME) started successfully."
 	@echo "To use $(PROJECT_NAME), run:"
 	@echo "alias $(PROJECT_NAME)='$(CONTAINER_RUNTIME) exec -it $(PROJECT_NAME)-container /app/$(PROJECT_NAME)'"
 
-.PHONY: uninstall-docker
-uninstall-docker: check-container-tool ## Uninstall app from $(CONTAINER_RUNTIME)
-	@echo "Stopping and removing container in $(CONTAINER_RUNTIME)..."
+.PHONY: stop-container
+stop-container: check-container-tool ## Stop and remove container
+	@echo "Stopping and removing container..."
 	$(CONTAINER_RUNTIME) stop $(PROJECT_NAME)-container && $(CONTAINER_RUNTIME) rm $(PROJECT_NAME)-container
-	@echo "$(CONTAINER_RUNTIME) uninstallation complete. Remove alias if set: unalias $(PROJECT_NAME)"
-
-### Kubernetes Targets (kubectl)
-
-.PHONY: install-k8s
-install-k8s: check-kubectl check-kustomize check-envsubst ## Install on Kubernetes
-	export PROJECT_NAME=${PROJECT_NAME}
-	export NAMESPACE=${NAMESPACE}
-	@echo "Creating namespace (if needed) and setting context to $(NAMESPACE)..."
-	kubectl create namespace $(NAMESPACE) 2>/dev/null || true
-	kubectl config set-context --current --namespace=$(NAMESPACE)
-	@echo "Deploying resources from deploy/ ..."
-	# Build the kustomization from deploy, substitute variables, and apply the YAML
-	kustomize build deploy/environments/openshift-base | envsubst | kubectl apply -f -
-	@echo "Waiting for pod to become ready..."
-	sleep 5
-	@POD=$$(kubectl get pod -l app=$(PROJECT_NAME)-statefulset -o jsonpath='{.items[0].metadata.name}'); \
-	echo "Kubernetes installation complete."; \
-	echo "To use the app, run:"; \
-	echo "alias $(PROJECT_NAME)='kubectl exec -n $(NAMESPACE) -it $$POD -- /app/$(PROJECT_NAME)'"
-
-.PHONY: uninstall-k8s
-uninstall-k8s: check-kubectl check-kustomize check-envsubst ## Uninstall from Kubernetes
-	export PROJECT_NAME=${PROJECT_NAME}
-	export NAMESPACE=${NAMESPACE}
-	@echo "Removing resources from Kubernetes..."
-	kustomize build deploy/environments/openshift-base | envsubst | kubectl delete --force -f - || true
-	POD=$$(kubectl get pod -l app=$(PROJECT_NAME)-statefulset -o jsonpath='{.items[0].metadata.name}'); \
-	echo "Deleting pod: $$POD"; \
-	kubectl delete pod "$$POD" --force --grace-period=0 || true; \
-	echo "Kubernetes uninstallation complete. Remove alias if set: unalias $(PROJECT_NAME)"
-
-### OpenShift Targets (oc)
-
-.PHONY: install-openshift
-install-openshift: check-kubectl check-kustomize check-envsubst ## Install on OpenShift
-	@echo $$PROJECT_NAME $$NAMESPACE $$IMAGE_TAG_BASE $$VERSION
-	@echo "Creating namespace $(NAMESPACE)..."
-	kubectl create namespace $(NAMESPACE) 2>/dev/null || true
-	@echo "Deploying common resources from deploy/ ..."
-	# Build and substitute the base manifests from deploy, then apply them
-	kustomize build deploy/environments/openshift-base | envsubst '$$PROJECT_NAME $$NAMESPACE $$IMAGE_TAG_BASE $$VERSION' | kubectl apply -n $(NAMESPACE) -f -
-	@echo "Waiting for pod to become ready..."
-	sleep 5
-	@POD=$$(kubectl get pod -l app=$(PROJECT_NAME)-statefulset -n $(NAMESPACE) -o jsonpath='{.items[0].metadata.name}'); \
-	echo "OpenShift installation complete."; \
-	echo "To use the app, run:"; \
-	echo "alias $(PROJECT_NAME)='kubectl exec -n $(NAMESPACE) -it $$POD -- /app/$(PROJECT_NAME)'"
-
-.PHONY: uninstall-openshift
-uninstall-openshift: check-kubectl check-kustomize check-envsubst ## Uninstall from OpenShift
-	@echo "Removing resources from OpenShift..."
-	kustomize build deploy/environments/openshift-base | envsubst '$$PROJECT_NAME $$NAMESPACE $$IMAGE_TAG_BASE $$VERSION' | kubectl delete --force -f - || true
-	# @if kubectl api-resources --api-group=route.openshift.io | grep -q Route; then \
-	#   envsubst '$$PROJECT_NAME $$NAMESPACE $$IMAGE_TAG_BASE $$VERSION' < deploy/openshift/route.yaml | kubectl delete --force -f - || true; \
-	# fi
-	@POD=$$(kubectl get pod -l app=$(PROJECT_NAME)-statefulset -n $(NAMESPACE) -o jsonpath='{.items[0].metadata.name}'); \
-	echo "Deleting pod: $$POD"; \
-	kubectl delete pod "$$POD" --force --grace-period=0 || true; \
-	echo "OpenShift uninstallation complete. Remove alias if set: unalias $(PROJECT_NAME)"
-
-### RBAC Targets (using kustomize and envsubst)
-
-.PHONY: install-rbac
-install-rbac: check-kubectl check-kustomize check-envsubst ## Install RBAC
-	@echo "Applying RBAC configuration from deploy/rbac..."
-	kustomize build deploy/environments/openshift-base/rbac | envsubst '$$PROJECT_NAME $$NAMESPACE $$IMAGE_TAG_BASE $$VERSION' | kubectl apply -f -
-
-.PHONY: uninstall-rbac
-uninstall-rbac: check-kubectl check-kustomize check-envsubst ## Uninstall RBAC
-	@echo "Removing RBAC configuration from deploy/rbac..."
-	kustomize build deploy/environments/openshift-base/rbac | envsubst '$$PROJECT_NAME $$NAMESPACE $$IMAGE_TAG_BASE $$VERSION' | kubectl delete -f - || true
+	@echo "$(CONTAINER_RUNTIME) stopped and removed. Remove alias if set: unalias $(PROJECT_NAME)"
 
 ##@ Environment
 .PHONY: env
 env: ## Print environment variables
-	@echo "IMAGE_TAG_BASE=$(IMAGE_TAG_BASE)"
-	@echo "IMG=$(IMG)"
+	@echo "TARGETOS=$(TARGETOS)"
+	@echo "TARGETARCH=$(TARGETARCH)"
 	@echo "CONTAINER_RUNTIME=$(CONTAINER_RUNTIME)"
-
-.PHONY: check-typos
-check-typos: $(TYPOS) ## Check for spelling errors using typos (exits with error if found)
-	@echo "🔍 Checking for spelling errors with typos..."
-	@TYPOS_OUTPUT=$$($(TYPOS) --format brief 2>&1); \
-	if [ $$? -eq 0 ]; then \
-		echo "✅ No spelling errors found!"; \
-		echo "🎉 Spelling check completed successfully!"; \
-	else \
-		echo "❌ Spelling errors found!"; \
-		echo "🔧 You can try 'make fix-typos' to automatically fix the spelling errors and run 'make check-typos' again"; \
-		echo "$$TYPOS_OUTPUT"; \
-		exit 1; \
-	fi
-	
-##@ Tools
-
-.PHONY: check-tools
-check-tools: \
-  check-go \
-  check-ginkgo \
-  check-golangci-lint \
-  check-kustomize \
-  check-envsubst \
-  check-container-tool \
-  check-kubectl \
-  check-buildah
-	@echo "✅ All required tools are installed."
-
-.PHONY: check-go
-check-go:
-	@command -v go >/dev/null 2>&1 || { \
-	  echo "❌ Go is not installed. Install it from https://golang.org/dl/"; exit 1; }
-
-.PHONY: check-ginkgo
-check-ginkgo:
-	@command -v ginkgo >/dev/null 2>&1 || { \
-	  echo "❌ ginkgo is not installed. Install with: go install github.com/onsi/ginkgo/v2/ginkgo@latest"; exit 1; }
-
-.PHONY: check-golangci-lint
-check-golangci-lint:
-	@command -v golangci-lint >/dev/null 2>&1 || { \
-	  echo "❌ golangci-lint is not installed. Install from https://golangci-lint.run/usage/install/"; exit 1; }
-
-.PHONY: check-kustomize
-check-kustomize:
-	@command -v kustomize >/dev/null 2>&1 || { \
-	  echo "❌ kustomize is not installed. Install it from https://kubectl.docs.kubernetes.io/installation/kustomize/"; exit 1; }
-
-.PHONY: check-envsubst
-check-envsubst:
-	@command -v envsubst >/dev/null 2>&1 || { \
-	  echo "❌ envsubst is not installed. It is part of gettext."; \
-	  echo "🔧 Try: sudo apt install gettext OR brew install gettext"; exit 1; }
-
-.PHONY: check-container-tool
-check-container-tool:
-	@if [ -z "$(CONTAINER_RUNTIME)" ]; then \
-		echo "❌ Error: No container tool detected. Please install docker or podman."; \
-		exit 1; \
-	else \
-		echo "✅ Container tool '$(CONTAINER_RUNTIME)' found."; \
-	fi
-	  
-
-.PHONY: check-kubectl
-check-kubectl:
-	@command -v kubectl >/dev/null 2>&1 || { \
-	  echo "❌ kubectl is not installed. Install it from https://kubernetes.io/docs/tasks/tools/"; exit 1; }
-
-.PHONY: check-builder
-check-builder:
-	@if [ -z "$(BUILDER)" ]; then \
-		echo "❌ No container builder tool (buildah, docker, or podman) found."; \
-		exit 1; \
-	else \
-		echo "✅ Using builder: $(BUILDER)"; \
-	fi
-
-##@ Alias checking
-.PHONY: check-alias
-check-alias: check-container-tool
-	@echo "🔍 Checking alias functionality for container '$(PROJECT_NAME)-container'..."
-	@if ! $(CONTAINER_RUNTIME) exec $(PROJECT_NAME)-container /app/$(PROJECT_NAME) --help >/dev/null 2>&1; then \
-	  echo "⚠️  The container '$(PROJECT_NAME)-container' is running, but the alias might not work."; \
-	  echo "🔧 Try: $(CONTAINER_RUNTIME) exec -it $(PROJECT_NAME)-container /app/$(PROJECT_NAME)"; \
-	else \
-	  echo "✅ Alias is likely to work: alias $(PROJECT_NAME)='$(CONTAINER_RUNTIME) exec -it $(PROJECT_NAME)-container /app/$(PROJECT_NAME)'"; \
-	fi
+	@echo "EPP_TAG=$(EPP_TAG)"
+	@echo "EPP_IMAGE=$(EPP_IMAGE)"
+	@echo "SIDECAR_TAG=$(SIDECAR_TAG)"
+	@echo "SIDECAR_IMAGE=$(SIDECAR_IMAGE)"
+	@echo "VLLM_SIMULATOR_TAG=$(VLLM_SIMULATOR_TAG)"
+	@echo "VLLM_IMAGE=$(VLLM_IMAGE)"
+	@echo "VLLM_RENDER_IMAGE=$(VLLM_RENDER_IMAGE)"
+	@echo "BUILDER_IMAGE=$(BUILDER_IMAGE)"
 
 .PHONY: print-namespace
 print-namespace: ## Print the current namespace
@@ -371,84 +523,23 @@ print-namespace: ## Print the current namespace
 print-project-name: ## Print the current project name
 	@echo "$(PROJECT_NAME)"
 
-.PHONY: install-hooks
-install-hooks: ## Install git hooks
-	git config core.hooksPath hooks
+##@ Deprecated aliases for backwards compatibility
+.PHONY: install-docker
+install-docker: ## DEPRECATED: Use 'make run-container' instead
+	@echo "WARNING: 'make install-docker' is deprecated. Use 'make run-container' instead."
+	@$(MAKE) run-container
 
-##@ Dev Environments
+.PHONY: uninstall-docker
+uninstall-docker: ## DEPRECATED: Use 'make stop-container' instead
+	@echo "WARNING: 'make uninstall-docker' is deprecated. Use 'make stop-container' instead."
+	@$(MAKE) stop-container
 
-KIND_CLUSTER_NAME ?= llm-d-inference-scheduler-dev
-KIND_GATEWAY_HOST_PORT ?= 30080
+.PHONY: install
+install: ## DEPRECATED: Use 'make run-container' instead
+	@echo "WARNING: 'make install' is deprecated. Use 'make run-container' instead."
+	@$(MAKE) run-container
 
-.PHONY: env-dev-kind
-env-dev-kind: ## Run under kind ($(KIND_CLUSTER_NAME))
-	@if [ "$$PD_ENABLED" = "true" ] && [ "$$KV_CACHE_ENABLED" = "true" ]; then \
-		echo "Error: Both PD_ENABLED and KV_CACHE_ENABLED are true. Skipping env-dev-kind."; \
-		exit 1; \
-	else \
-		$(MAKE) image-build && \
-		CLUSTER_NAME=$(KIND_CLUSTER_NAME) \
-		GATEWAY_HOST_PORT=$(KIND_GATEWAY_HOST_PORT) \
-		IMAGE_REGISTRY=$(IMAGE_REGISTRY) \
-		EPP_TAG=$(EPP_TAG) \
-		./scripts/kind-dev-env.sh; \
-	fi
-
-.PHONY: clean-env-dev-kind
-clean-env-dev-kind:      ## Cleanup kind setup (delete cluster $(KIND_CLUSTER_NAME))
-	@echo "INFO: cleaning up kind cluster $(KIND_CLUSTER_NAME)"
-	kind delete cluster --name $(KIND_CLUSTER_NAME)
-
-
-# Kubernetes Development Environment - Deploy
-# This target deploys the inference scheduler stack in a specific namespace for development and testing.
-.PHONY: env-dev-kubernetes
-env-dev-kubernetes: check-kubectl check-kustomize check-envsubst
-	IMAGE_REGISTRY=$(IMAGE_REGISTRY) ./scripts/kubernetes-dev-env.sh 2>&1
-
-# Kubernetes Development Environment - Teardown
-.PHONY: clean-env-dev-kubernetes
-clean-env-dev-kubernetes: check-kubectl check-kustomize check-envsubst
-	@CLEAN=true ./scripts/kubernetes-dev-env.sh 2>&1
-	@echo "INFO: Finished cleanup of development environment for namespace $(NAMESPACE)"
-
-##@ Dependencies
-
-.PHONY: install-dependencies
-install-dependencies: ## Install development dependencies based on OS/ARCH
-	@echo "Checking and installing development dependencies..."
-	@if [ "$(TARGETOS)" = "linux" ]; then \
-	  if [ -x "$$(command -v apt)" ]; then \
-	    if ! dpkg -s libzmq3-dev >/dev/null 2>&1 || ! dpkg -s g++ >/dev/null 2>&1; then \
-	      echo "Installing dependencies with apt..."; \
-	      apt-get update && apt-get install -y libzmq3-dev g++; \
-	    else \
-	      echo "✅ ZMQ and g++ are already installed."; \
-	    fi; \
-	  elif [ -x "$$(command -v dnf)" ]; then \
-	    if ! dnf -q list installed zeromq-devel >/dev/null 2>&1 || ! dnf -q list installed gcc-c++ >/dev/null 2>&1; then \
-	      echo "Installing dependencies with dnf..."; \
-	      dnf install -y zeromq-devel gcc-c++; \
-	    else \
-	      echo "✅ ZMQ and gcc-c++ are already installed."; \
-	    fi; \
-	  else \
-	    echo "Unsupported Linux package manager. Install libzmq and g++/gcc-c++ manually."; \
-	    exit 1; \
-	  fi; \
-	elif [ "$(TARGETOS)" = "darwin" ]; then \
-	  if [ -x "$$(command -v brew)" ]; then \
-	    if ! brew list zeromq pkg-config >/dev/null 2>&1; then \
-	      echo "Installing dependencies with brew..."; \
-	      brew install zeromq pkg-config; \
-	    else \
-	      echo "✅ ZeroMQ and pkgconf are already installed."; \
-	    fi; \
-	  else \
-	    echo "Homebrew is not installed and is required to install zeromq. Install it from https://brew.sh/"; \
-	    exit 1; \
-	  fi; \
-	else \
-	  echo "Unsupported OS: $(TARGETOS). Install development dependencies manually."; \
-	  exit 1; \
-	fi
+.PHONY: uninstall
+uninstall: ## DEPRECATED: Use 'make stop-container' instead
+	@echo "WARNING: 'make uninstall' is deprecated. Use 'make stop-container' instead."
+	@$(MAKE) stop-container

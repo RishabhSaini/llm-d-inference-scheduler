@@ -1,0 +1,391 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package runner
+
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+	"testing"
+
+	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	"github.com/go-logr/logr/testr"
+	healthPb "google.golang.org/grpc/health/grpc_health_v1"
+	v1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
+
+	"github.com/llm-d/llm-d-router/pkg/epp/datalayer"
+	"github.com/llm-d/llm-d-router/pkg/epp/datastore"
+	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
+)
+
+// Mock Datastore
+type mockDatastore struct {
+	datastore.Datastore
+	hasSynced bool
+	pool      *datalayer.EndpointPool
+	err       error
+}
+
+func (m *mockDatastore) PoolHasSynced() bool {
+	return m.hasSynced
+}
+
+func (m *mockDatastore) PoolGet() (*datalayer.EndpointPool, error) {
+	return m.pool, m.err
+}
+
+// Mock AppProtocolSupporter
+type mockSupporter struct {
+	protocols []v1.AppProtocol
+}
+
+func (m *mockSupporter) Claims() fwkrh.Claims {
+	return fwkrh.Claims{
+		Protocols: m.protocols,
+	}
+}
+
+type mockReadinessChecker struct {
+	name string
+	err  error
+}
+
+func (m *mockReadinessChecker) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Type: "mock", Name: m.name}
+}
+
+func (m *mockReadinessChecker) CheckReady() error { return m.err }
+
+type mockPlugin struct{}
+
+func (*mockPlugin) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Type: "mock", Name: "ordinary"}
+}
+
+func TestPluginReadinessCheckers(t *testing.T) {
+	want := &mockReadinessChecker{name: "readiness"}
+	got := pluginReadinessCheckers([]fwkplugin.Plugin{&mockPlugin{}, want})
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("pluginReadinessCheckers() = %v, want [%v]", got, want)
+	}
+}
+
+func TestHealthServer_Check(t *testing.T) {
+	tests := []struct {
+		name                  string
+		leaderElectionEnabled bool
+		isLeader              bool
+		draining              bool
+		hasSynced             bool
+		pool                  *datalayer.EndpointPool
+		poolErr               error
+		supporters            []appProtocolSupporter
+		readinessCheckers     []fwkplugin.ReadinessChecker
+		service               string
+		wantStatus            healthPb.HealthCheckResponse_ServingStatus
+	}{
+		{
+			name:                  "LeaderElectionDisabled_Live_ProtocolMatches",
+			leaderElectionEnabled: false,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			wantStatus:            healthPb.HealthCheckResponse_SERVING,
+		},
+		{
+			name:                  "LeaderElectionDisabled_NotLive",
+			leaderElectionEnabled: false,
+			hasSynced:             false,
+			wantStatus:            healthPb.HealthCheckResponse_NOT_SERVING,
+		},
+		{
+			name:                  "LeaderElectionDisabled_ProtocolMismatch",
+			leaderElectionEnabled: false,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolH2C},
+			supporters:            []appProtocolSupporter{&mockSupporter{protocols: []v1.AppProtocol{v1.AppProtocolHTTP}}},
+			wantStatus:            healthPb.HealthCheckResponse_NOT_SERVING,
+		},
+		{
+			// File-discovery pools and K8s pools without an explicit AppProtocol
+			// must not be constrained to HTTP -- a non-HTTP parser would otherwise
+			// lock the EPP out of SERVING permanently.
+			name:                  "LeaderElectionDisabled_EmptyAppProtocol_NoConstraint",
+			leaderElectionEnabled: false,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{},
+			supporters:            []appProtocolSupporter{&mockSupporter{protocols: []v1.AppProtocol{v1.AppProtocolH2C}}},
+			wantStatus:            healthPb.HealthCheckResponse_SERVING,
+		},
+		{
+			name:                  "LeaderElectionDisabled_PluginNotReady",
+			leaderElectionEnabled: false,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			readinessCheckers: []fwkplugin.ReadinessChecker{
+				&mockReadinessChecker{name: "unready", err: errors.New("initial sync pending")},
+			},
+			wantStatus: healthPb.HealthCheckResponse_NOT_SERVING,
+		},
+		{
+			name:                  "LeaderElectionDisabled_Liveness_IgnoresPluginReadiness",
+			leaderElectionEnabled: false,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			readinessCheckers: []fwkplugin.ReadinessChecker{
+				&mockReadinessChecker{name: "unready", err: errors.New("initial sync pending")},
+			},
+			service:    LivenessCheckService,
+			wantStatus: healthPb.HealthCheckResponse_SERVING,
+		},
+		{
+			name:                  "LeaderElectionEnabled_Liveness_AlwaysServing",
+			leaderElectionEnabled: true,
+			service:               LivenessCheckService,
+			wantStatus:            healthPb.HealthCheckResponse_SERVING,
+		},
+		{
+			name:                  "LeaderElectionEnabled_Readiness_AllPluginsReady",
+			leaderElectionEnabled: true,
+			isLeader:              true,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			readinessCheckers: []fwkplugin.ReadinessChecker{
+				&mockReadinessChecker{name: "first"},
+				&mockReadinessChecker{name: "second"},
+			},
+			service:    ReadinessCheckService,
+			wantStatus: healthPb.HealthCheckResponse_SERVING,
+		},
+		{
+			name:                  "LeaderElectionEnabled_Readiness_OnePluginNotReady",
+			leaderElectionEnabled: true,
+			isLeader:              true,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			readinessCheckers: []fwkplugin.ReadinessChecker{
+				&mockReadinessChecker{name: "ready"},
+				&mockReadinessChecker{name: "unready", err: errors.New("backend unavailable")},
+			},
+			service:    ReadinessCheckService,
+			wantStatus: healthPb.HealthCheckResponse_NOT_SERVING,
+		},
+		{
+			name:                  "LeaderElectionEnabled_Liveness_IgnoresPluginReadiness",
+			leaderElectionEnabled: true,
+			readinessCheckers: []fwkplugin.ReadinessChecker{
+				&mockReadinessChecker{name: "unready", err: errors.New("initial sync pending")},
+			},
+			service:    LivenessCheckService,
+			wantStatus: healthPb.HealthCheckResponse_SERVING,
+		},
+		{
+			name:                  "LeaderElectionEnabled_Readiness_Live_Leader_ProtocolMatches",
+			leaderElectionEnabled: true,
+			isLeader:              true,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			service:               ReadinessCheckService,
+			wantStatus:            healthPb.HealthCheckResponse_SERVING,
+		},
+		{
+			name:                  "LeaderElectionEnabled_Readiness_NotLive",
+			leaderElectionEnabled: true,
+			isLeader:              true,
+			hasSynced:             false,
+			service:               ReadinessCheckService,
+			wantStatus:            healthPb.HealthCheckResponse_NOT_SERVING,
+		},
+		{
+			name:                  "LeaderElectionEnabled_Readiness_NotLeader",
+			leaderElectionEnabled: true,
+			isLeader:              false,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			service:               ReadinessCheckService,
+			wantStatus:            healthPb.HealthCheckResponse_NOT_SERVING,
+		},
+		{
+			name:                  "LeaderElectionEnabled_Readiness_ProtocolMismatch",
+			leaderElectionEnabled: true,
+			isLeader:              true,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolH2C},
+			supporters:            []appProtocolSupporter{&mockSupporter{protocols: []v1.AppProtocol{v1.AppProtocolHTTP}}},
+			service:               ReadinessCheckService,
+			wantStatus:            healthPb.HealthCheckResponse_NOT_SERVING,
+		},
+		{
+			name:                  "LeaderElectionEnabled_EmptyService_ReflectsReadiness_Serving",
+			leaderElectionEnabled: true,
+			isLeader:              true,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			service:               "",
+			wantStatus:            healthPb.HealthCheckResponse_SERVING,
+		},
+		{
+			name:                  "LeaderElectionEnabled_EmptyService_ReflectsPluginReadiness",
+			leaderElectionEnabled: true,
+			isLeader:              true,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			readinessCheckers: []fwkplugin.ReadinessChecker{
+				&mockReadinessChecker{name: "unready", err: errors.New("initial sync pending")},
+			},
+			service:    "",
+			wantStatus: healthPb.HealthCheckResponse_NOT_SERVING,
+		},
+		{
+			name:                  "LeaderElectionEnabled_ExtProc_ReflectsReadiness_Serving",
+			leaderElectionEnabled: true,
+			isLeader:              true,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			service:               extProcPb.ExternalProcessor_ServiceDesc.ServiceName,
+			wantStatus:            healthPb.HealthCheckResponse_SERVING,
+		},
+		{
+			name:                  "LeaderElectionEnabled_ExtProc_ReflectsPluginReadiness",
+			leaderElectionEnabled: true,
+			isLeader:              true,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			readinessCheckers: []fwkplugin.ReadinessChecker{
+				&mockReadinessChecker{name: "unready", err: errors.New("initial sync pending")},
+			},
+			service:    extProcPb.ExternalProcessor_ServiceDesc.ServiceName,
+			wantStatus: healthPb.HealthCheckResponse_NOT_SERVING,
+		},
+		{
+			name:                  "LeaderElectionEnabled_UnknownService",
+			leaderElectionEnabled: true,
+			service:               "unknown",
+			wantStatus:            healthPb.HealthCheckResponse_SERVICE_UNKNOWN,
+		},
+		{
+			// Graceful drain: an otherwise-Ready leader reports NotServing on
+			// readiness so Kubernetes drains it from the Service endpoints.
+			name:                  "LeaderElectionEnabled_Draining_Readiness_NotServing",
+			leaderElectionEnabled: true,
+			isLeader:              true,
+			draining:              true,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			service:               ReadinessCheckService,
+			wantStatus:            healthPb.HealthCheckResponse_NOT_SERVING,
+		},
+		{
+			// Liveness must stay Serving while draining so we are not restarted
+			// mid-drain.
+			name:                  "LeaderElectionEnabled_Draining_Liveness_StillServing",
+			leaderElectionEnabled: true,
+			isLeader:              true,
+			draining:              true,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			service:               LivenessCheckService,
+			wantStatus:            healthPb.HealthCheckResponse_SERVING,
+		},
+		{
+			// Drain also applies in all-active (no leader election).
+			name:                  "LeaderElectionDisabled_Draining_NotServing",
+			leaderElectionEnabled: false,
+			draining:              true,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			wantStatus:            healthPb.HealthCheckResponse_NOT_SERVING,
+		},
+		{
+			// The ext_proc service check is what Envoy's cluster health check hits.
+			name:                  "LeaderElectionEnabled_Draining_ExtProc_NotServing",
+			leaderElectionEnabled: true,
+			isLeader:              true,
+			draining:              true,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			service:               extProcPb.ExternalProcessor_ServiceDesc.ServiceName,
+			wantStatus:            healthPb.HealthCheckResponse_NOT_SERVING,
+		},
+		{
+			// The empty service name is used by load balancers for overall health.
+			name:                  "LeaderElectionEnabled_Draining_EmptyService_NotServing",
+			leaderElectionEnabled: true,
+			isLeader:              true,
+			draining:              true,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			service:               "",
+			wantStatus:            healthPb.HealthCheckResponse_NOT_SERVING,
+		},
+		{
+			name:                  "MultipleSupporters_AllMatch",
+			leaderElectionEnabled: false,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			supporters: []appProtocolSupporter{
+				&mockSupporter{protocols: []v1.AppProtocol{v1.AppProtocolHTTP}},
+				&mockSupporter{protocols: []v1.AppProtocol{v1.AppProtocolHTTP}},
+			},
+			wantStatus: healthPb.HealthCheckResponse_SERVING,
+		},
+		{
+			name:                  "MultipleSupporters_OneMismatch",
+			leaderElectionEnabled: false,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			supporters: []appProtocolSupporter{
+				&mockSupporter{protocols: []v1.AppProtocol{v1.AppProtocolHTTP}},
+				&mockSupporter{protocols: []v1.AppProtocol{v1.AppProtocolH2C}},
+			},
+			wantStatus: healthPb.HealthCheckResponse_NOT_SERVING,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger := testr.New(t)
+			ds := &mockDatastore{
+				hasSynced: tt.hasSynced,
+				pool:      tt.pool,
+				err:       tt.poolErr,
+			}
+			var isLeader atomic.Bool
+			isLeader.Store(tt.isLeader)
+			var draining atomic.Bool
+			draining.Store(tt.draining)
+
+			s := &healthServer{
+				logger:                logger,
+				datastore:             ds,
+				isLeader:              &isLeader,
+				leaderElectionEnabled: tt.leaderElectionEnabled,
+				supporters:            tt.supporters,
+				readinessCheckers:     tt.readinessCheckers,
+				draining:              &draining,
+			}
+
+			resp, err := s.Check(context.Background(), &healthPb.HealthCheckRequest{Service: tt.service})
+			if err != nil {
+				t.Fatalf("Check failed: %v", err)
+			}
+			if resp.Status != tt.wantStatus {
+				t.Errorf("Check() status = %v, want %v", resp.Status, tt.wantStatus)
+			}
+		})
+	}
+}

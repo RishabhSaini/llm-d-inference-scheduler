@@ -16,111 +16,63 @@ limitations under the License.
 package main
 
 import (
-	"crypto/tls"
-	"flag"
-	"net/url"
-	"os"
+	"context"
 
-	"k8s.io/klog/v2"
+	"github.com/spf13/pflag"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/llm-d/llm-d-inference-scheduler/pkg/sidecar/proxy"
-	"github.com/llm-d/llm-d-inference-scheduler/pkg/sidecar/version"
+	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	"github.com/llm-d/llm-d-router/pkg/sidecar/proxy"
+	"github.com/llm-d/llm-d-router/pkg/sidecar/version"
 )
 
 func main() {
-	port := flag.String("port", "8000", "the port the sidecar is listening on")
-	vLLMPort := flag.String("vllm-port", "8001", "the port vLLM is listening on")
-	vLLMDataParallelSize := flag.Int("data-parallel-size", 1, "the vLLM DATA-PARALLEL-SIZE value")
-	connector := flag.String("connector", "nixlv2", "the P/D connector being used. Either nixl, nixlv2 or lmcache")
-	prefillerUseTLS := flag.Bool("prefiller-use-tls", false, "whether to use TLS when sending requests to prefillers")
-	decoderUseTLS := flag.Bool("decoder-use-tls", false, "whether to use TLS when sending requests to the decoder")
-	prefillerInsecureSkipVerify := flag.Bool("prefiller-tls-insecure-skip-verify", false, "configures the proxy to skip TLS verification for requests to prefiller")
-	decoderInsecureSkipVerify := flag.Bool("decoder-tls-insecure-skip-verify", false, "configures the proxy to skip TLS verification for requests to decoder")
-	secureProxy := flag.Bool("secure-proxy", true, "Enables secure proxy. Defaults to true.")
-	certPath := flag.String(
-		"cert-path", "", "The path to the certificate for secure proxy. The certificate and private key files "+
-			"are assumed to be named tls.crt and tls.key, respectively. If not set, and secureProxy is enabled, "+
-			"then a self-signed certificate is used (for testing).")
-	enableSSRFProtection := flag.Bool("enable-ssrf-protection", false, "enable SSRF protection using InferencePool allowlisting")
-	inferencePoolNamespace := flag.String("inference-pool-namespace", os.Getenv("INFERENCE_POOL_NAMESPACE"), "the Kubernetes namespace to watch for InferencePool resources (defaults to INFERENCE_POOL_NAMESPACE env var)")
-	inferencePoolName := flag.String("inference-pool-name", os.Getenv("INFERENCE_POOL_NAME"), "the specific InferencePool name to watch (defaults to INFERENCE_POOL_NAME env var)")
+	// Initialize options with defaults
+	opts := proxy.NewOptions()
 
-	klog.InitFlags(nil)
-	flag.Parse()
+	// Add options flags (including logging flags)
+	opts.AddFlags(pflag.CommandLine)
+	pflag.Parse()
 
-	// make sure to flush logs before exiting
-	defer klog.Flush()
+	logger := opts.NewLogger()
+	log.SetLogger(logger)
 
 	ctx := ctrl.SetupSignalHandler()
-	logger := klog.FromContext(ctx)
+	log.IntoContext(ctx, logger)
+
+	// Complete options (handles migration from deprecated flags, populates Config)
+	if err := opts.Complete(); err != nil {
+		logger.Error(err, "Failed to complete configuration")
+		return
+	}
+
+	// Validate options
+	if err := opts.Validate(); err != nil {
+		logger.Error(err, "Invalid configuration")
+		return
+	}
+
+	// Initialize tracing conditionally using config
+	if opts.Tracing {
+		shutdown, err := tracing.InitTracing(ctx, logger, "llm-d-disagg-sidecar")
+		if err != nil {
+			// Log error but don't fail - tracing is optional
+			logger.Error(err, "Failed to initialize tracing")
+		} else if shutdown != nil {
+			defer func() {
+				if err := shutdown(context.Background()); err != nil {
+					logger.Error(err, "Failed to shutdown tracing")
+				}
+			}()
+		}
+	}
 
 	logger.Info("Proxy starting", "Built on", version.BuildRef, "From Git SHA", version.CommitSHA)
+	logger.Info("Proxy configuration", "config", opts.Config)
 
-	if *connector != proxy.ConnectorNIXLV2 && *connector != proxy.ConnectorLMCache {
-		logger.Info("Error: --connector must either be 'nixlv2' or 'lmcache'")
-		return
-	}
-	logger.Info("p/d connector validated", "connector", connector)
-
-	// Determine namespace and pool name for SSRF protection
-	if *enableSSRFProtection {
-		if *inferencePoolNamespace == "" {
-			logger.Info("Error: --inference-pool-namespace or INFERENCE_POOL_NAMESPACE environment variable is required when --enable-ssrf-protection is true")
-			return
-		}
-		if *inferencePoolName == "" {
-			logger.Info("Error: --inference-pool-name or INFERENCE_POOL_NAME environment variable is required when --enable-ssrf-protection is true")
-			return
-		}
-
-		logger.Info("SSRF protection enabled", "namespace", inferencePoolNamespace, "poolName", inferencePoolName)
-	}
-
-	// start reverse proxy HTTP server
-	scheme := "http"
-	if *decoderUseTLS {
-		scheme = "https"
-	}
-	targetURL, err := url.Parse(scheme + "://localhost:" + *vLLMPort)
-	if err != nil {
-		logger.Error(err, "failed to create targetURL")
-		return
-	}
-
-	var cert *tls.Certificate
-	if *secureProxy {
-		var tempCert tls.Certificate
-		if *certPath != "" {
-			tempCert, err = tls.LoadX509KeyPair(*certPath+"/tls.crt", *certPath+"/tls.key")
-		} else {
-			tempCert, err = proxy.CreateSelfSignedTLSCertificate()
-		}
-		if err != nil {
-			logger.Error(err, "failed to create TLS certificate")
-			return
-		}
-		cert = &tempCert
-	}
-
-	config := proxy.Config{
-		Connector:                   *connector,
-		PrefillerUseTLS:             *prefillerUseTLS,
-		PrefillerInsecureSkipVerify: *prefillerInsecureSkipVerify,
-		DecoderInsecureSkipVerify:   *decoderInsecureSkipVerify,
-		DataParallelSize:            *vLLMDataParallelSize,
-	}
-
-	// Create SSRF protection validator
-	validator, err := proxy.NewAllowlistValidator(*enableSSRFProtection, *inferencePoolNamespace, *inferencePoolName)
-	if err != nil {
-		logger.Error(err, "failed to create SSRF protection validator")
-		return
-	}
-
-	proxyServer := proxy.NewProxy(*port, targetURL, config)
-
-	if err := proxyServer.Start(ctx, cert, validator); err != nil {
+	proxyServer := proxy.NewProxy(opts.Config)
+	if err := proxyServer.Start(ctx); err != nil {
 		logger.Error(err, "failed to start proxy server")
 	}
 }

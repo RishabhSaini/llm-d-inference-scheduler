@@ -5,22 +5,53 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  pull_request_target:
+    branches: [ main ]
+    types: [ opened, synchronize, reopened ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  
+  check-for-markdown-files:
+    runs-on: ubuntu-latest
+    outputs:
+      src: ${{ steps.filter.outputs.src }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            src:
+              - '**/*.md'
+
   lychee:
     name: Check Markdown Links
+    needs: check-for-markdown-files
+    # pull_request_target fires even when GITHUB_TOKEN creates the PR (e.g. the
+    # release-notes bot). pull_request does not. We register pull_request_target
+    # so bot-created PRs get a "skipped" conclusion that satisfies branch
+    # protection, but we skip all real work: pull_request already covers human
+    # PRs, and running twice would cause the concurrency group to cancel one run.
+    if: github.event_name != 'pull_request_target' && needs.check-for-markdown-files.outputs.src == 'true'
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
-      - name: Install lychee v0.18.1
-        run: |
-          curl -Ls https://github.com/lycheeverse/lychee/releases/download/lychee-v0.18.1/lychee-x86_64-unknown-linux-gnu.tar.gz | tar xz
-          sudo mv lychee /usr/local/bin
-
-      - name: Run lychee on Markdown files with config
-        run: |
-          find . -name "*.md" -print0 | xargs -0 lychee --config .lychee.toml --verbose --no-progress
+      - name: Run lychee link checker
+        uses: lycheeverse/lychee-action@v2.9.0
+        with:
+          # Exclude release-notes.d/ — fragments are sourced verbatim from
+          # PR bodies; let the original PR's link check be authoritative.
+          args: '--config .lychee.toml --verbose --no-progress --exclude-path release-notes.d **/*.md'
+          fail: true

@@ -7,21 +7,28 @@ on:
   release:
     types: [published]  # Also runs when a GitHub release is published
 
-jobs:
-  docker-build-and-push:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v5
+permissions:
+  contents: read
+  packages: write
+  security-events: write
 
-      - name: Set project name from repository
+jobs:
+  set-params:
+    runs-on: ubuntu-latest
+    outputs:
+      epp_name: ${{ steps.version.outputs.epp_name }}
+      sidecar_name: ${{ steps.version.outputs.sidecar_name }}
+      coordinator_name: ${{ steps.version.outputs.coordinator_name }}
+      tag: ${{ steps.tag.outputs.tag }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      - name: Set image names
         id: version
         run: |
           repo="${GITHUB_REPOSITORY##*/}"
-          echo "project_name=$repo" >> "$GITHUB_OUTPUT"
-
-      - name: Print project name
-        run: echo "Project is ${{ steps.version.outputs.project_name }}"
+          echo "epp_name=${repo}-endpoint-picker" >> "$GITHUB_OUTPUT"
+          echo "sidecar_name=${repo}-disagg-sidecar" >> "$GITHUB_OUTPUT"
+          echo "coordinator_name=${repo}-coordinator" >> "$GITHUB_OUTPUT"
 
       - name: Determine tag name
         id: tag
@@ -37,27 +44,53 @@ jobs:
           echo "prerelease=${PRE_RELEASE}" >> "$GITHUB_OUTPUT"
         shell: bash
 
-      - name: Build and push EPP image
-        uses: ./.github/actions/docker-build-and-push
-        with:
-          docker-file: Dockerfile.epp
-          tag: ${{ steps.tag.outputs.tag }}
-          image-name: ${{ steps.version.outputs.project_name }}
-          registry: ghcr.io/llm-d
-          github-token: ${{ secrets.GHCR_TOKEN }}
-          prerelease: ${{ steps.tag.outputs.prerelease }}
+  build-and-push:
+    needs: set-params
+    uses: ./.github/workflows/ci-build-images.yaml
+    with:
+      epp-image-name: ${{ needs.set-params.outputs.epp_name }}
+      sidecar-image-name: ${{ needs.set-params.outputs.sidecar_name }}
+      coordinator-image-name: ${{ needs.set-params.outputs.coordinator_name }}
+      tag: ${{ needs.set-params.outputs.tag }}
+      prerelease: ${{ fromJSON(needs.set-params.outputs.prerelease) }}
+      chart-suffix: ""
 
-      - name: Build and push sidecar image
-        uses: ./.github/actions/docker-build-and-push
-        with:
-          docker-file: Dockerfile.sidecar
-          tag: ${{ steps.tag.outputs.tag }}
-          image-name: llm-d-routing-sidecar
-          registry: ghcr.io/llm-d
-          github-token: ${{ secrets.GHCR_TOKEN }}
-          prerelease: ${{ steps.tag.outputs.prerelease }}
+  upload-artifacts:
+    needs: set-params
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
 
-      - name: Run Trivy scan
-        uses: ./.github/actions/trivy-scan
+      - name: Set up Go
+        uses: actions/setup-go@v7
         with:
-          image: ghcr.io/llm-d/${{ steps.version.outputs.project_name }}:${{ steps.tag.outputs.tag }}
+          go-version-file: go.mod
+
+      - name: Setup Kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: 'latest'
+
+      - name: Build Artifacts
+        run: |
+          make artifacts BUNDLE_VERSION=${{ needs.set-params.outputs.tag }}
+
+      - name: Upload Release Assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          files=$(find artifacts -type f -size +0c | tr '\n' ' ')
+          if [ -z "$files" ]; then
+            echo "No artifacts to upload."
+            exit 0
+          fi
+          if gh release view "${{ needs.set-params.outputs.tag }}" >/dev/null 2>&1; then
+            gh release upload "${{ needs.set-params.outputs.tag }}" $files --clobber
+          else
+            echo "Release ${{ needs.set-params.outputs.tag }} does not exist. Creating a draft release..."
+            gh release create "${{ needs.set-params.outputs.tag }}" $files --draft --title "${{ needs.set-params.outputs.tag }}" --notes "Release ${{ needs.set-params.outputs.tag }}"
+          fi
+

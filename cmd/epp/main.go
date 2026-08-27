@@ -28,16 +28,23 @@ import (
 	"os"
 
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/gateway-api-inference-extension/cmd/epp/runner"
 
-	"github.com/llm-d/llm-d-inference-scheduler/pkg/plugins"
+	"github.com/llm-d/llm-d-router/cmd/epp/runner"
 )
 
 func main() {
-	// Register llm-d-inference-scheduler plugins
-	plugins.RegisterAllPlugins()
+	os.Exit(run())
+}
 
-	if err := runner.NewRunner().Run(ctrl.SetupSignalHandler()); err != nil {
-		os.Exit(1)
+func run() int {
+	ctx := ctrl.SetupSignalHandler()
+
+	// Note: GIE built-in plugins are automatically registered by the runner
+	// when it processes configuration in runner.parsePluginsConfiguration()
+
+	if err := runner.NewRunner().
+		Run(ctx); err != nil {
+		return 1
 	}
+	return 0
 }

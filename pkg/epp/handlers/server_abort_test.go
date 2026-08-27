@@ -1,0 +1,229 @@
+/*
+Copyright 2026 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package handlers
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	envoyTypePb "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"github.com/go-logr/logr"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/metadata"
+
+	errcommon "github.com/llm-d/llm-d-router/pkg/common/error"
+	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
+)
+
+// mockProcessServer implements ExternalProcessor_ProcessServer for testing.
+type mockProcessServer struct {
+	sentResponses []*extProcPb.ProcessingResponse
+}
+
+func (m *mockProcessServer) Send(resp *extProcPb.ProcessingResponse) error {
+	m.sentResponses = append(m.sentResponses, resp)
+	return nil
+}
+
+// Unused methods to satisfy the interface.
+func (m *mockProcessServer) Recv() (*extProcPb.ProcessingRequest, error) {
+	return nil, errors.New("sentinel error for mock process server")
+}
+func (m *mockProcessServer) SetHeader(metadata.MD) error  { return nil }
+func (m *mockProcessServer) SendHeader(metadata.MD) error { return nil }
+func (m *mockProcessServer) SetTrailer(metadata.MD)       {}
+func (m *mockProcessServer) Context() context.Context     { return context.Background() }
+func (m *mockProcessServer) SendMsg(any) error            { return nil }
+func (m *mockProcessServer) RecvMsg(any) error            { return nil }
+
+func TestUpdateStateAndSendIfNeeded_Evicted(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                 string
+		requestDroppedReason errcommon.RequestDroppedReason
+		wantHeader           bool
+	}{
+		{
+			name:                 "with eviction reason",
+			requestDroppedReason: errcommon.RequestDroppedReasonEvicted,
+			wantHeader:           true,
+		},
+		{
+			name:                 "without eviction reason",
+			requestDroppedReason: "",
+			wantHeader:           false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			srv := &mockProcessServer{}
+			logger := logr.Discard()
+
+			reqCtx := &RequestContext{
+				requestState:         requestEvicted,
+				requestDroppedReason: tt.requestDroppedReason,
+			}
+
+			err := reqCtx.updateStateAndSendIfNeeded(srv, logger)
+			require.NoError(t, err)
+
+			require.Len(t, srv.sentResponses, 1, "Should send exactly one response")
+			ir := srv.sentResponses[0].GetImmediateResponse()
+			require.NotNil(t, ir, "Response should be an ImmediateResponse")
+			assert.Equal(t, envoyTypePb.StatusCode_TooManyRequests, ir.Status.Code)
+			assert.Equal(t, []byte("request evicted by flow control"), ir.Body)
+
+			if tt.wantHeader {
+				require.NotNil(t, ir.Headers, "Should have HeaderMutation when eviction reason is set")
+				require.Len(t, ir.Headers.SetHeaders, 1)
+				gotHeaders := make(map[string]string, len(ir.Headers.SetHeaders))
+				for _, header := range ir.Headers.SetHeaders {
+					gotHeaders[header.Header.Key] = string(header.Header.RawValue)
+				}
+				assert.Equal(t, map[string]string{errcommon.RequestDroppedReasonHeaderKey: string(tt.requestDroppedReason)}, gotHeaders)
+			} else {
+				assert.Nil(t, ir.Headers, "Should not have HeaderMutation when eviction reason is empty")
+			}
+		})
+	}
+}
+
+func TestUpdateStateAndSendIfNeeded_NotEvicted(t *testing.T) {
+	t.Parallel()
+	srv := &mockProcessServer{}
+	logger := logr.Discard()
+
+	// Normal state — no responses queued, nothing should be sent.
+	reqCtx := &RequestContext{
+		requestState: requestReceived,
+	}
+
+	err := reqCtx.updateStateAndSendIfNeeded(srv, logger)
+	require.NoError(t, err)
+	assert.Empty(t, srv.sentResponses, "Should not send any response for normal state without queued responses")
+}
+
+func TestTerminationCause(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		state  streamRequestState
+		ctxErr error
+		want   fwkrc.TerminationCause
+	}{
+		{
+			name:   "evicted outranks a cancelled context",
+			state:  requestEvicted,
+			ctxErr: context.Canceled,
+			want:   fwkrc.TerminationCauseEvicted,
+		},
+		{
+			name:   "a cancelled context is the client going away",
+			state:  responseReceived,
+			ctxErr: context.Canceled,
+			want:   fwkrc.TerminationCauseClientDisconnect,
+		},
+		{
+			name:  "anything else is an error",
+			state: responseReceived,
+			want:  fwkrc.TerminationCauseError,
+		},
+		{
+			name:  "skipped response processing never observes completion",
+			state: requestResponseProcessingSkipped,
+			want:  fwkrc.TerminationCauseError,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			reqCtx := &RequestContext{requestState: tt.state}
+			assert.Equal(t, tt.want, terminationCause(reqCtx, tt.ctxErr))
+		})
+	}
+}
+
+func TestTerminationCauseFromGRPCTrailers(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   string
+		useValue bool
+		want     fwkrc.TerminationCause
+	}{
+		{
+			name:   "OK",
+			status: "0",
+			want:   "",
+		},
+		{
+			name:   "internal error",
+			status: "13",
+			want:   fwkrc.TerminationCauseError,
+		},
+		{
+			name:   "cancelled",
+			status: "1",
+			want:   fwkrc.TerminationCauseError,
+		},
+		{
+			name: "missing grpc status",
+			want: "",
+		},
+		{
+			name:     "internal error from value",
+			status:   "13",
+			useValue: true,
+			want:     fwkrc.TerminationCauseError,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trailers := &extProcPb.HttpTrailers{
+				Trailers: &corev3.HeaderMap{},
+			}
+
+			if tt.status != "" {
+				header := &corev3.HeaderValue{
+					Key: "grpc-status",
+				}
+				if tt.useValue {
+					header.Value = tt.status
+				} else {
+					header.RawValue = []byte(tt.status)
+				}
+
+				trailers.Trailers.Headers = []*corev3.HeaderValue{header}
+			}
+
+			assert.Equal(
+				t,
+				tt.want,
+				terminationCauseFromGRPCTrailers(trailers),
+			)
+		})
+	}
+}
