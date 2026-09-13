@@ -355,13 +355,24 @@ func (c chatContent) MarshalJSON() ([]byte, error) {
 
 // chatPart is one OpenAI content part. Only the field matching Type is set.
 type chatPart struct {
-	Type     string        `json:"type"`
-	Text     string        `json:"text,omitempty"`
-	ImageURL *chatImageURL `json:"image_url,omitempty"`
+	Type       string          `json:"type"`
+	Text       string          `json:"text,omitempty"`
+	ImageURL   *chatImageURL   `json:"image_url,omitempty"`
+	AudioURL   *chatAudioURL   `json:"audio_url,omitempty"`
+	InputAudio *chatInputAudio `json:"input_audio,omitempty"`
 }
 
 type chatImageURL struct {
 	URL string `json:"url"`
+}
+
+type chatAudioURL struct {
+	URL string `json:"url"`
+}
+
+type chatInputAudio struct {
+	Data   string `json:"data"`
+	Format string `json:"format"`
 }
 
 // buildChatRenderRequest projects the kvcache RenderChatRequest into the
@@ -403,6 +414,10 @@ func toChatContent(c *tokenizerTypes.Content) *chatContent {
 			parts = append(parts, chatPart{Type: blockTypeText, Text: b.Text})
 		case blockTypeImageURL:
 			parts = append(parts, chatPart{Type: blockTypeImageURL, ImageURL: &chatImageURL{URL: b.ImageURL.URL}})
+		case "audio_url":
+			parts = append(parts, chatPart{Type: "audio_url", AudioURL: &chatAudioURL{URL: b.AudioURL.URL}})
+		case "input_audio":
+			parts = append(parts, chatPart{Type: "input_audio", InputAudio: &chatInputAudio{Data: b.InputAudio.Data, Format: b.InputAudio.Format}})
 		default:
 			// Unsupported by the kvcache ContentBlock schema; skip.
 		}

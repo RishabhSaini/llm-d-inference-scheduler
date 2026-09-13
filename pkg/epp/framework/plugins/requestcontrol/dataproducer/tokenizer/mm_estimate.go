@@ -185,12 +185,10 @@ type videoMetadata struct {
 }
 
 // audioMetadata carries per-request audio properties parsed from the
-// x-llm-d-audio- request headers. A zero field means "not provided"; the
-// estimator falls back per field to configuration and then built-in defaults.
+// x-llm-d-audio- request headers. A zero duration means "not provided"; the
+// estimator falls back to configuration and then built-in defaults.
 type audioMetadata struct {
-	duration   float64 // seconds
-	sampleRate int     // Hz
-	channels   int
+	duration float64 // seconds
 }
 
 // videoEstimator estimates a video's placeholder-token count as

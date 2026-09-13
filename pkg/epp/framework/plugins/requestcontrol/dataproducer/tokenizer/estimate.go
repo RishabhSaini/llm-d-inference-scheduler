@@ -104,16 +104,6 @@ func parseAudioMetadataHeaders(headers map[string]string) audioMetadata {
 			meta.duration = v
 		}
 	}
-	if s, ok := metadata.GetLowerCaseHeaderValue(headers, metadata.AudioSampleRateHeaderKey); ok {
-		if v, err := strconv.Atoi(s); err == nil && v > 0 {
-			meta.sampleRate = v
-		}
-	}
-	if s, ok := metadata.GetLowerCaseHeaderValue(headers, metadata.AudioChannelsHeaderKey); ok {
-		if v, err := strconv.Atoi(s); err == nil && v > 0 {
-			meta.channels = v
-		}
-	}
 	return meta
 }
 
@@ -260,8 +250,8 @@ func (b estimateBackend) appendChatMessage(out []byte, features []fwkrh.MultiMod
 			out, features = appendMMAsset(out, features, fwkrh.ModalityVideo, block.VideoURL.URL, b.vid.placeholderCount(meta.video))
 		case "audio_url":
 			out, features = appendMMAsset(out, features, fwkrh.ModalityAudio, block.AudioURL.URL, b.aud.placeholderCount(block.AudioURL.URL, false, meta.audio))
-		case "input_audio", "audio":
-			data := block.InputAudio.Data
+		case "input_audio":
+			data := block.InputAudio.Data + block.InputAudio.Format
 			out, features = appendMMAsset(out, features, fwkrh.ModalityAudio, data, b.aud.placeholderCount(data, true, meta.audio))
 		}
 	}

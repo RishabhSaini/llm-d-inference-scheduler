@@ -706,6 +706,45 @@ func TestBuildChatRenderRequest_MessageFields(t *testing.T) {
 	assert.Equal(t, "out", msgs[1]["content"])
 }
 
+// TestBuildChatRenderRequest_AudioBlocks asserts the render fallback path
+// preserves audio_url and input_audio parts so non-PayloadMap callers
+// (e.g. Vertex AI gRPC) still reach vLLM with audio intact.
+func TestBuildChatRenderRequest_AudioBlocks(t *testing.T) {
+	req := &tokenizerTypes.RenderChatRequest{
+		Conversation: []tokenizerTypes.Conversation{
+			{Role: "user", Content: &tokenizerTypes.Content{Structured: []tokenizerTypes.ContentBlock{
+				{Type: "text", Text: "transcribe this"},
+				{Type: "audio_url", AudioURL: tokenizerTypes.AudioURLBlock{URL: "https://example.test/speech.wav"}},
+				{Type: "input_audio", InputAudio: tokenizerTypes.AudioBlock{Data: "AAAA", Format: "wav"}},
+			}}},
+		},
+	}
+
+	data, err := json.Marshal(buildChatRenderRequest(req))
+	require.NoError(t, err)
+
+	var msgs []map[string]any
+	require.NoError(t, json.Unmarshal(data, &struct {
+		Messages *[]map[string]any `json:"messages"`
+	}{&msgs}))
+	require.Len(t, msgs, 1)
+	parts, ok := msgs[0]["content"].([]any)
+	require.True(t, ok, "structured content must be forwarded as an array of parts")
+	require.Len(t, parts, 3)
+
+	assert.Equal(t, "text", parts[0].(map[string]any)["type"])
+
+	audioURL, ok := parts[1].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "audio_url", audioURL["type"])
+	require.Equal(t, map[string]any{"url": "https://example.test/speech.wav"}, audioURL["audio_url"])
+
+	inputAudio, ok := parts[2].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "input_audio", inputAudio["type"])
+	require.Equal(t, map[string]any{"data": "AAAA", "format": "wav"}, inputAudio["input_audio"])
+}
+
 // TestVLLMHTTPRenderer_RenderSpanName asserts the outbound render span is
 // named after the render route instead of the transport default "HTTP POST".
 func TestVLLMHTTPRenderer_RenderSpanName(t *testing.T) {

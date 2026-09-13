@@ -86,15 +86,9 @@ func (c Content) PlainText() string {
 	}
 	var sb strings.Builder
 	for _, block := range c.Structured {
-		switch block.Type {
-		case "text":
+		if block.Type == "text" {
 			sb.WriteString(block.Text)
 			sb.WriteString(" ")
-		case "audio_url", "input_audio", "audio":
-			if block.AudioURL.URL != "" {
-				sb.WriteString(block.AudioURL.URL)
-				sb.WriteString(" ")
-			}
 		}
 	}
 	return sb.String()

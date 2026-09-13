@@ -606,23 +606,9 @@ func TestParseAudioMetadataHeaders(t *testing.T) {
 		want    audioMetadata
 	}{
 		{
-			name: "all present",
-			headers: map[string]string{
-				metadata.AudioDurationHeaderKey:   "12.5",
-				metadata.AudioSampleRateHeaderKey: "44100",
-				metadata.AudioChannelsHeaderKey:   "2",
-			},
-			want: audioMetadata{duration: 12.5, sampleRate: 44100, channels: 2},
-		},
-		{
-			name:    "duration only",
-			headers: map[string]string{metadata.AudioDurationHeaderKey: "5.0"},
-			want:    audioMetadata{duration: 5.0},
-		},
-		{
-			name:    "sample rate only",
-			headers: map[string]string{metadata.AudioSampleRateHeaderKey: "16000"},
-			want:    audioMetadata{sampleRate: 16000},
+			name:    "duration present",
+			headers: map[string]string{metadata.AudioDurationHeaderKey: "12.5"},
+			want:    audioMetadata{duration: 12.5},
 		},
 		{
 			name:    "empty",
@@ -630,22 +616,14 @@ func TestParseAudioMetadataHeaders(t *testing.T) {
 			want:    audioMetadata{},
 		},
 		{
-			name: "malformed values ignored",
-			headers: map[string]string{
-				metadata.AudioDurationHeaderKey:   "abc",
-				metadata.AudioSampleRateHeaderKey: "",
-				metadata.AudioChannelsHeaderKey:   "x",
-			},
-			want: audioMetadata{},
+			name:    "malformed value ignored",
+			headers: map[string]string{metadata.AudioDurationHeaderKey: "abc"},
+			want:    audioMetadata{},
 		},
 		{
-			name: "non-positive ignored",
-			headers: map[string]string{
-				metadata.AudioDurationHeaderKey:   "-1",
-				metadata.AudioSampleRateHeaderKey: "0",
-				metadata.AudioChannelsHeaderKey:   "0",
-			},
-			want: audioMetadata{},
+			name:    "non-positive ignored",
+			headers: map[string]string{metadata.AudioDurationHeaderKey: "-1"},
+			want:    audioMetadata{},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
