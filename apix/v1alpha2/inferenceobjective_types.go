@@ -75,19 +75,27 @@ type InferenceObjectiveSpec struct {
 	Priority *int32 `json:"priority,omitempty"`
 
 	// PoolRef targets a single inference pool in the same namespace.
-	// Set PoolRef or PoolRefs. An objective applies to a pool when any
-	// entry matches.
+	// Prefer PoolRefs. Set PoolRef, PoolRefs, or PoolSelector. An
+	// objective applies to a pool when any entry matches.
 	//
 	// +optional
 	PoolRef *PoolObjectReference `json:"poolRef,omitempty"`
 
 	// PoolRefs targets multiple inference pools in the same namespace.
-	// Set PoolRef or PoolRefs. An objective applies to a pool when any
-	// entry matches.
+	// Set PoolRef, PoolRefs, or PoolSelector. An objective applies to a
+	// pool when any entry matches.
 	//
 	// +optional
 	// +kubebuilder:validation:MinItems=1
 	PoolRefs []PoolObjectReference `json:"poolRefs,omitempty"`
+
+	// PoolSelector selects inference pools in the same namespace by
+	// label. Set PoolRef, PoolRefs, or PoolSelector. An objective
+	// applies to a pool when any entry matches. An empty selector
+	// matches every pool in the namespace.
+	//
+	// +optional
+	PoolSelector *metav1.LabelSelector `json:"poolSelector,omitempty"`
 }
 
 // InferenceObjectiveStatus defines the observed state of InferenceObjective

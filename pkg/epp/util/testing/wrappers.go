@@ -160,6 +160,11 @@ func (m *InferenceObjectiveWrapper) PoolRefs(refs ...v1alpha2.PoolObjectReferenc
 	return m
 }
 
+func (m *InferenceObjectiveWrapper) PoolSelector(sel *metav1.LabelSelector) *InferenceObjectiveWrapper {
+	m.Spec.PoolSelector = sel
+	return m
+}
+
 func (m *InferenceObjectiveWrapper) Priority(priority int32) *InferenceObjectiveWrapper {
 	m.Spec.Priority = &priority
 	return m

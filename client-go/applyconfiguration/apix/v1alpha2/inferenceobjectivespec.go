@@ -2,6 +2,10 @@
 
 package v1alpha2
 
+import (
+	v1 "k8s.io/client-go/applyconfigurations/meta/v1"
+)
+
 // InferenceObjectiveSpecApplyConfiguration represents a declarative configuration of the InferenceObjectiveSpec type for use
 // with apply.
 //
@@ -29,13 +33,18 @@ type InferenceObjectiveSpecApplyConfiguration struct {
 	// Similarly requests with a Priority of -10 will always be served after requests with Priority of 0.
 	Priority *int32 `json:"priority,omitempty"`
 	// PoolRef targets a single inference pool in the same namespace.
-	// Set PoolRef or PoolRefs. An objective applies to a pool when any
-	// entry matches.
+	// Prefer PoolRefs. Set PoolRef, PoolRefs, or PoolSelector. An
+	// objective applies to a pool when any entry matches.
 	PoolRef *PoolObjectReferenceApplyConfiguration `json:"poolRef,omitempty"`
 	// PoolRefs targets multiple inference pools in the same namespace.
-	// Set PoolRef or PoolRefs. An objective applies to a pool when any
-	// entry matches.
+	// Set PoolRef, PoolRefs, or PoolSelector. An objective applies to a
+	// pool when any entry matches.
 	PoolRefs []PoolObjectReferenceApplyConfiguration `json:"poolRefs,omitempty"`
+	// PoolSelector selects inference pools in the same namespace by
+	// label. Set PoolRef, PoolRefs, or PoolSelector. An objective
+	// applies to a pool when any entry matches. An empty selector
+	// matches every pool in the namespace.
+	PoolSelector *v1.LabelSelectorApplyConfiguration `json:"poolSelector,omitempty"`
 }
 
 // InferenceObjectiveSpecApplyConfiguration constructs a declarative configuration of the InferenceObjectiveSpec type for use with
@@ -70,5 +79,13 @@ func (b *InferenceObjectiveSpecApplyConfiguration) WithPoolRefs(values ...*PoolO
 		}
 		b.PoolRefs = append(b.PoolRefs, *values[i])
 	}
+	return b
+}
+
+// WithPoolSelector sets the PoolSelector field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the PoolSelector field is set to the value of the last call.
+func (b *InferenceObjectiveSpecApplyConfiguration) WithPoolSelector(value *v1.LabelSelectorApplyConfiguration) *InferenceObjectiveSpecApplyConfiguration {
+	b.PoolSelector = value
 	return b
 }
