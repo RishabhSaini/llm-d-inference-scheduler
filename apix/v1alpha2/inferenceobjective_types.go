@@ -27,6 +27,7 @@ import (
 // +kubebuilder:subresource:status
 // +kubebuilder:storageversion
 // +kubebuilder:printcolumn:name="Inference Pool",type=string,JSONPath=`.spec.poolRef.name`
+// +kubebuilder:printcolumn:name="Inference Pools",type=string,JSONPath=`.spec.poolRefs[*].name`
 // +kubebuilder:printcolumn:name="Priority",type=string,JSONPath=`.spec.priority`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // +genclient

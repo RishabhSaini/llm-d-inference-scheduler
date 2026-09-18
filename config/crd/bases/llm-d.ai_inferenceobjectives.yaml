@@ -17,6 +17,9 @@ spec:
     - jsonPath: .spec.poolRef.name
       name: Inference Pool
       type: string
+    - jsonPath: .spec.poolRefs[*].name
+      name: Inference Pools
+      type: string
     - jsonPath: .spec.priority
       name: Priority
       type: string
