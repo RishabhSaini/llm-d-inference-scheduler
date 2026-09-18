@@ -140,12 +140,23 @@ func (m *InferenceObjectiveWrapper) ObjRef() *v1alpha2.InferenceObjective {
 }
 
 func (m *InferenceObjectiveWrapper) PoolName(poolName string) *InferenceObjectiveWrapper {
+	if m.Spec.PoolRef == nil {
+		m.Spec.PoolRef = &v1alpha2.PoolObjectReference{}
+	}
 	m.Spec.PoolRef.Name = v1alpha2.ObjectName(poolName)
 	return m
 }
 
 func (m *InferenceObjectiveWrapper) PoolGroup(poolGroup string) *InferenceObjectiveWrapper {
+	if m.Spec.PoolRef == nil {
+		m.Spec.PoolRef = &v1alpha2.PoolObjectReference{}
+	}
 	m.Spec.PoolRef.Group = v1alpha2.Group(poolGroup)
+	return m
+}
+
+func (m *InferenceObjectiveWrapper) PoolRefs(refs ...v1alpha2.PoolObjectReference) *InferenceObjectiveWrapper {
+	m.Spec.PoolRefs = refs
 	return m
 }
 

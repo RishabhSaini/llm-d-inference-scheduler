@@ -79,6 +79,35 @@ var (
 			CreationTimestamp(metav1.Unix(1000, 0)).
 			PoolName(inferencePool.Name).
 			PoolGroup(routing.InferencePoolAPIGroup).ObjRef()
+	infObjectiveShared = testutil.MakeInferenceObjective("shared").
+				Namespace(inferencePool.Namespace).
+				Priority(int32(1)).
+				CreationTimestamp(metav1.Unix(1000, 0)).
+				PoolRefs(
+			v1alpha2.PoolObjectReference{Name: v1alpha2.ObjectName(inferencePool.Name), Group: v1alpha2.Group(routing.InferencePoolAPIGroup)},
+			v1alpha2.PoolObjectReference{Name: "test-pool2", Group: v1alpha2.Group(routing.InferencePoolAPIGroup)},
+		).ObjRef()
+	infObjectiveSharedMiss = testutil.MakeInferenceObjective("shared-miss").
+				Namespace(inferencePool.Namespace).
+				Priority(int32(1)).
+				CreationTimestamp(metav1.Unix(1000, 0)).
+				PoolRefs(
+			v1alpha2.PoolObjectReference{Name: "test-pool2", Group: v1alpha2.Group(routing.InferencePoolAPIGroup)},
+		).ObjRef()
+	infObjectiveUnion = testutil.MakeInferenceObjective("union").
+				Namespace(inferencePool.Namespace).
+				Priority(int32(1)).
+				CreationTimestamp(metav1.Unix(1000, 0)).
+				PoolName("test-pool2").
+				PoolGroup(routing.InferencePoolAPIGroup).
+				PoolRefs(
+			v1alpha2.PoolObjectReference{Name: v1alpha2.ObjectName(inferencePool.Name), Group: v1alpha2.Group(routing.InferencePoolAPIGroup)},
+		).ObjRef()
+	infObjectiveNoPool = testutil.MakeInferenceObjective("no-pool").
+				Namespace(inferencePool.Namespace).
+				Priority(int32(1)).
+				CreationTimestamp(metav1.Unix(1000, 0)).
+				ObjRef()
 )
 
 func TestInferenceObjectiveReconciler(t *testing.T) {
@@ -141,6 +170,26 @@ func TestInferenceObjectiveReconciler(t *testing.T) {
 		{
 			name:           "Objective ignored due to group mismatch for the inference inferencePool",
 			objective:      infObjective1DiffGroup,
+			wantObjectives: []*v1alpha2.InferenceObjective{},
+		},
+		{
+			name:           "Shared objective via poolRefs includes own pool",
+			objective:      infObjectiveShared,
+			wantObjectives: []*v1alpha2.InferenceObjective{infObjectiveShared},
+		},
+		{
+			name:           "Shared objective via poolRefs excludes own pool",
+			objective:      infObjectiveSharedMiss,
+			wantObjectives: []*v1alpha2.InferenceObjective{},
+		},
+		{
+			name:           "poolRefs matches when poolRef points elsewhere",
+			objective:      infObjectiveUnion,
+			wantObjectives: []*v1alpha2.InferenceObjective{infObjectiveUnion},
+		},
+		{
+			name:           "No pool reference set, objective ignored",
+			objective:      infObjectiveNoPool,
 			wantObjectives: []*v1alpha2.InferenceObjective{},
 		},
 	}

@@ -66,7 +66,7 @@ func (c *InferenceObjectiveReconciler) Reconcile(ctx context.Context, req ctrl.R
 			"replacement", "llm-d.ai/v1alpha2/InferenceObjective")
 	}
 
-	if notFound || !infObjective.DeletionTimestamp.IsZero() || infObjective.Spec.PoolRef.Name != v1alpha2.ObjectName(c.PoolGKNN.Name) || infObjective.Spec.PoolRef.Group != v1alpha2.Group(c.PoolGKNN.Group) {
+	if notFound || !infObjective.DeletionTimestamp.IsZero() || !matchesPool(infObjective.Spec, c.PoolGKNN.Name, c.PoolGKNN.Group) {
 		// InferenceObjective object got deleted or changed the referenced inferencePool.
 		c.Datastore.ObjectiveDelete(req.NamespacedName)
 		c.syncPriorityBands()
@@ -74,7 +74,7 @@ func (c *InferenceObjectiveReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	// Add or update if the InferenceObjective instance has a creation timestamp older than the existing entry of the model.
-	logger = logger.WithValues("poolRef", infObjective.Spec.PoolRef)
+	logger = logger.WithValues("poolRef", infObjective.Spec.PoolRef, "poolRefs", infObjective.Spec.PoolRefs)
 	c.Datastore.ObjectiveSet(infObjective)
 	c.syncPriorityBands()
 	logger.Info("Added/Updated InferenceObjective")
@@ -112,5 +112,17 @@ func (c *InferenceObjectiveReconciler) SetupWithManager(mgr ctrl.Manager) error 
 }
 
 func (c *InferenceObjectiveReconciler) eventPredicate(infObjective *v1alpha2.InferenceObjective) bool {
-	return string(infObjective.Spec.PoolRef.Name) == c.PoolGKNN.Name && string(infObjective.Spec.PoolRef.Group) == c.PoolGKNN.Group
+	return matchesPool(infObjective.Spec, c.PoolGKNN.Name, c.PoolGKNN.Group)
+}
+
+func matchesPool(spec v1alpha2.InferenceObjectiveSpec, poolName, poolGroup string) bool {
+	if spec.PoolRef != nil && string(spec.PoolRef.Name) == poolName && string(spec.PoolRef.Group) == poolGroup {
+		return true
+	}
+	for _, ref := range spec.PoolRefs {
+		if string(ref.Name) == poolName && string(ref.Group) == poolGroup {
+			return true
+		}
+	}
+	return false
 }

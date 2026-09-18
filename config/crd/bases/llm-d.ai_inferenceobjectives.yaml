@@ -59,8 +59,10 @@ spec:
               InferenceObjectives, defined by the Inference Platform Admin.
             properties:
               poolRef:
-                description: PoolRef is a reference to the inference pool, the pool
-                  must exist in the same namespace.
+                description: |-
+                  PoolRef targets a single inference pool in the same namespace.
+                  Set PoolRef or PoolRefs. An objective applies to a pool when any
+                  entry matches.
                 properties:
                   group:
                     default: inference.networking.k8s.io
@@ -83,6 +85,39 @@ spec:
                 required:
                 - name
                 type: object
+              poolRefs:
+                description: |-
+                  PoolRefs targets multiple inference pools in the same namespace.
+                  Set PoolRef or PoolRefs. An objective applies to a pool when any
+                  entry matches.
+                items:
+                  description: |-
+                    PoolObjectReference identifies an API object within the namespace of the
+                    referrer.
+                  properties:
+                    group:
+                      default: inference.networking.k8s.io
+                      description: Group is the group of the referent.
+                      maxLength: 253
+                      pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                      type: string
+                    kind:
+                      default: InferencePool
+                      description: Kind is kind of the referent. For example "InferencePool".
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$
+                      type: string
+                    name:
+                      description: Name is the name of the referent.
+                      maxLength: 253
+                      minLength: 1
+                      type: string
+                  required:
+                  - name
+                  type: object
+                minItems: 1
+                type: array
               priority:
                 description: |-
                   Priority defines how important it is to serve the request compared to other requests in the same pool.
@@ -99,8 +134,6 @@ spec:
                   Similarly requests with a Priority of -10 will always be served after requests with Priority of 0.
                 format: int32
                 type: integer
-            required:
-            - poolRef
             type: object
           status:
             description: InferenceObjectiveStatus defines the observed state of InferenceObjective
