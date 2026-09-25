@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -494,5 +495,157 @@ func TestInferenceObjectiveEventPredicate(t *testing.T) {
 	}
 	if reconciler.eventPredicate(infObjective1Pool2) {
 		t.Error("poolRef objective for another pool should not pass the event predicate")
+	}
+	if !reconciler.eventPredicateV1(v1ObjectiveSelector) {
+		t.Error("selector objective should pass the v1 event predicate without label lookup")
+	}
+	if !reconciler.eventPredicateV1(v1ObjectiveShared) {
+		t.Error("poolRefs objective for own pool should pass the v1 event predicate")
+	}
+	miss := testutil.MakeV1InferenceObjective("miss").
+		Namespace(inferencePool.Namespace).
+		PoolRefs(
+			apixv1.PoolObjectReference{Name: "test-pool2", Group: apixv1.Group(routing.InferencePoolAPIGroup)},
+		).ObjRef()
+	if reconciler.eventPredicateV1(miss) {
+		t.Error("poolRefs objective for another pool should not pass the v1 event predicate")
+	}
+}
+
+// errorPoolReader fails pool reads to exercise the requeue path.
+type errorPoolReader struct {
+	client.Reader
+}
+
+func (r errorPoolReader) Get(ctx context.Context, nn types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*v1.InferencePool); ok {
+		return errors.NewServiceUnavailable("injected pool read error")
+	}
+	return r.Reader.Get(ctx, nn, obj, opts...)
+}
+
+func testReconciler(ds datastore.Datastore, reader client.Reader, watchV1 bool) *InferenceObjectiveReconciler {
+	return &InferenceObjectiveReconciler{
+		Reader:    reader,
+		Datastore: ds,
+		PoolGKNN: common.GKNN{
+			NamespacedName: types.NamespacedName{Name: inferencePool.Name, Namespace: inferencePool.Namespace},
+			GroupKind:      schema.GroupKind{Group: inferencePool.GroupVersionKind().Group, Kind: inferencePool.GroupVersionKind().Kind},
+		},
+		PrimaryV1: watchV1,
+	}
+}
+
+func TestInferenceObjectiveV1Deletion(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = v1alpha2.Install(scheme)
+	_ = apixv1.Install(scheme)
+	_ = v1.Install(scheme)
+	now := metav1.Now()
+	deleting := testutil.MakeV1InferenceObjective("deleting").
+		Namespace(inferencePool.Namespace).
+		Priority(int32(1)).
+		PoolRefs(
+			apixv1.PoolObjectReference{Name: apixv1.ObjectName(inferencePool.Name), Group: apixv1.Group(routing.InferencePoolAPIGroup)},
+		).ObjRef()
+	deleting.DeletionTimestamp = &now
+	deleting.Finalizers = []string{"finalizer"}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(deleting).
+		Build()
+	ds := datastore.NewDatastore(t.Context(), datalayer.NewTestRuntime(t, time.Second))
+	ds.ObjectiveSet(v1ObjectiveShared)
+	reconciler := testReconciler(ds, fakeClient, true)
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: deleting.Name, Namespace: deleting.Namespace},
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if got := ds.ObjectiveGet("deleting"); got != nil {
+		t.Errorf("expected deleted objective removed, got %v", got)
+	}
+	if got := ds.ObjectiveGet(v1ObjectiveShared.Name); got == nil {
+		t.Error("expected unrelated objective retained")
+	}
+}
+
+func TestInferenceObjectivePoolReadError(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = v1alpha2.Install(scheme)
+	_ = apixv1.Install(scheme)
+	_ = v1.Install(scheme)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(v1ObjectiveSelector).
+		Build()
+	ds := datastore.NewDatastore(t.Context(), datalayer.NewTestRuntime(t, time.Second))
+	reconciler := testReconciler(ds, errorPoolReader{Reader: fakeClient}, true)
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: v1ObjectiveSelector.Name, Namespace: v1ObjectiveSelector.Namespace},
+	})
+	if err == nil {
+		t.Error("expected pool read error to propagate for requeue")
+	}
+}
+
+type recordingBands struct {
+	submitted []map[int]struct{}
+}
+
+func (r *recordingBands) SubmitDesiredPriorities(desired map[int]struct{}) {
+	r.submitted = append(r.submitted, desired)
+}
+
+func TestInferenceObjectiveBandsDefaultUnsetPriority(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = v1alpha2.Install(scheme)
+	_ = apixv1.Install(scheme)
+	_ = v1.Install(scheme)
+	plain := testutil.MakeV1InferenceObjective("plain").
+		Namespace(inferencePool.Namespace).
+		PoolRefs(
+			apixv1.PoolObjectReference{Name: apixv1.ObjectName(inferencePool.Name), Group: apixv1.Group(routing.InferencePoolAPIGroup)},
+		).ObjRef()
+	prioritized := testutil.MakeV1InferenceObjective("prioritized").
+		Namespace(inferencePool.Namespace).
+		Priority(int32(7)).
+		CreationTimestamp(metav1.Unix(1000, 0)).
+		PoolRefs(
+			apixv1.PoolObjectReference{Name: apixv1.ObjectName(inferencePool.Name), Group: apixv1.Group(routing.InferencePoolAPIGroup)},
+		).ObjRef()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(plain, prioritized).
+		Build()
+	ds := datastore.NewDatastore(t.Context(), datalayer.NewTestRuntime(t, time.Second))
+	bands := &recordingBands{}
+	reconciler := testReconciler(ds, fakeClient, true)
+	reconciler.PriorityBandControlPlane = bands
+	for _, name := range []string{"plain", "prioritized"} {
+		_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: name, Namespace: inferencePool.Namespace},
+		})
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+	}
+	if len(bands.submitted) == 0 {
+		t.Fatal("expected band submissions")
+	}
+	last := bands.submitted[len(bands.submitted)-1]
+	if _, ok := last[7]; !ok {
+		t.Errorf("expected submitted bands %v to contain 7", last)
+	}
+	// The unset priority defaults to band 0 at store time.
+	if _, ok := last[0]; !ok {
+		t.Errorf("expected submitted bands %v to contain defaulted 0", last)
+	}
+	if len(last) != 2 {
+		t.Errorf("expected exactly the defaulted and set priorities submitted, got %v", last)
 	}
 }

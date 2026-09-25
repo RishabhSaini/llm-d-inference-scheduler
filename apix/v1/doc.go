@@ -16,9 +16,7 @@ limitations under the License.
 */
 
 // Package v1 contains API Schema definitions for the
-// llm-d.ai API group. This version is not served yet; serving starts with
-// the conversion strategy agreed for the v1 promotion. The types stay out
-// of CRD generation until then.
+// llm-d.ai API group.
 //
 // +k8s:openapi-gen=true
 // +kubebuilder:object:generate=true

@@ -183,6 +183,12 @@ func (d *Director) getInferenceObjective(ctx context.Context, reqCtx *handlers.R
 				Priority: &d.defaultPriority,
 			},
 		}
+	} else if infObjective.Spec.Priority == nil {
+		// The API defines an unset priority as 0. Copy before defaulting:
+		// stored objectives are shared with concurrent readers.
+		copied := *infObjective
+		copied.Spec.Priority = &d.defaultPriority
+		infObjective = &copied
 	}
 	return infObjective
 }

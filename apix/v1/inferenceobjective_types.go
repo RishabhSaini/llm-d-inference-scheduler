@@ -22,9 +22,7 @@ import (
 )
 
 // InferenceObjective is the Schema for the InferenceObjectives API.
-// Serving starts with the conversion strategy agreed for the v1 promotion;
-// until then v1alpha2 stays the storage version and v1 requests are not
-// served.
+// It serves as the storage version for multi-pool tier definitions.
 //
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
@@ -70,16 +68,16 @@ type InferenceObjectiveSpec struct {
 
 	// PoolRefs targets the inference pools in the same namespace that
 	// this objective applies to. An objective applies to a pool when any
-	// entry matches. At least one of PoolRefs, PoolSelector must select
-	// a pool; an object with neither is ignored by every pool.
+	// entry matches. An object with neither PoolRefs nor PoolSelector
+	// is ignored by every pool.
 	//
 	// +optional
 	// +kubebuilder:validation:MinItems=1
 	PoolRefs []PoolObjectReference `json:"poolRefs,omitempty"`
 
 	// PoolSelector selects inference pools in the same namespace by
-	// label. An objective applies to a pool when any entry matches. An
-	// empty selector matches every pool in the namespace.
+	// label. An objective applies to a pool when the selector matches
+	// its labels. An empty selector matches every pool in the namespace.
 	//
 	// +optional
 	PoolSelector *metav1.LabelSelector `json:"poolSelector,omitempty"`

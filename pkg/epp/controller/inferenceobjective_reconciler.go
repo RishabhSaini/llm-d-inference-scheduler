@@ -23,10 +23,10 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/utils/ptr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -100,9 +100,13 @@ func (c *InferenceObjectiveReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, nil
 	}
 
-	poolLabels, err := c.ownPoolLabels(ctx)
-	if err != nil {
-		return ctrl.Result{}, err
+	poolLabels := map[string]string{}
+	if current.Spec.PoolSelector != nil {
+		var err error
+		poolLabels, err = c.ownPoolLabels(ctx)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	if !matchesPool(current.Spec, c.PoolGKNN.Name, c.PoolGKNN.Group, poolLabels) {
 		// InferenceObjective object stopped targeting this inferencePool.
@@ -111,7 +115,7 @@ func (c *InferenceObjectiveReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, nil
 	}
 
-	// Add or update if the InferenceObjective instance has a creation timestamp older than the existing entry of the model.
+	// Add or update the stored objective.
 	logger = logger.WithValues("poolRefs", current.Spec.PoolRefs, "poolSelector", current.Spec.PoolSelector)
 	if current.Spec.Priority == nil {
 		// The API defines an unset priority as 0.
