@@ -83,14 +83,9 @@ func (cc *ControllerConfig) populateWithDiscovery(dc discovery.DiscoveryInterfac
 		cc.hasInferenceObjective = true
 		cc.InferenceObjectiveGV = gv
 		cc.hasV1InferenceObjective = gv == inferenceObjectiveV1GV
-		switch gv {
-		case inferenceObjectiveV1GV:
+		if gv == inferenceObjectiveV1GV {
 			if gvkExists(dc, inferenceAPIGV.WithKind("InferenceObjective")) {
 				cc.SecondaryObjectiveGV = inferenceAPIGV
-			}
-		case inferenceAPIGV:
-			if gvkExists(dc, inferenceObjectiveV1GV.WithKind("InferenceObjective")) {
-				cc.SecondaryObjectiveGV = inferenceObjectiveV1GV
 			}
 		}
 	}

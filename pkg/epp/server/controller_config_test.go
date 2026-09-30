@@ -50,6 +50,7 @@ func TestPopulateWithDiscovery(t *testing.T) {
 		wantInferenceObjectiveGV    schema.GroupVersion
 		wantInferenceModelRewriteGV schema.GroupVersion
 		wantV1InferenceObjective    bool
+		wantSecondaryObjectiveGV    schema.GroupVersion
 	}{
 		{
 			name: "Both resources exist in llm-d group",
@@ -116,6 +117,7 @@ func TestPopulateWithDiscovery(t *testing.T) {
 			wantInferenceObjectiveGV:    inferenceObjectiveV1GV,
 			wantInferenceModelRewriteGV: schema.GroupVersion{},
 			wantV1InferenceObjective:    true,
+			wantSecondaryObjectiveGV:    inferenceAPIGV,
 		},
 		{
 			name: "v1 group present without InferenceObjective kind",
@@ -166,7 +168,23 @@ func TestPopulateWithDiscovery(t *testing.T) {
 			if cc.hasV1InferenceObjective != tt.wantV1InferenceObjective {
 				t.Errorf("populateWithDiscovery() hasV1InferenceObjective = %v, want %v", cc.hasV1InferenceObjective, tt.wantV1InferenceObjective)
 			}
+			if cc.SecondaryObjectiveGV != tt.wantSecondaryObjectiveGV {
+				t.Errorf("populateWithDiscovery() SecondaryObjectiveGV = %v, want %v", cc.SecondaryObjectiveGV, tt.wantSecondaryObjectiveGV)
+			}
 		})
+	}
+}
+
+func TestNewDefaultRunnerStaysV1Alpha2Staged(t *testing.T) {
+	r := NewDefaultExtProcServerRunner()
+	if r.ControllerCfg.InferenceObjectiveGV != inferenceAPIGV {
+		t.Errorf("default InferenceObjectiveGV = %v, want staged %v", r.ControllerCfg.InferenceObjectiveGV, inferenceAPIGV)
+	}
+	if r.ControllerCfg.hasV1InferenceObjective {
+		t.Error("default hasV1InferenceObjective = true, want false until serving PR")
+	}
+	if r.ControllerCfg.SecondaryObjectiveGV != (schema.GroupVersion{}) {
+		t.Errorf("default SecondaryObjectiveGV = %v, want empty", r.ControllerCfg.SecondaryObjectiveGV)
 	}
 }
 

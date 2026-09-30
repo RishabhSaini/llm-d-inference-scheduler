@@ -23,12 +23,14 @@ import (
 )
 
 // ConvertFromV1Alpha2 converts a v1alpha2 InferenceObjective to v1. The
-// single pool reference becomes the sole list entry.
+// single pool reference becomes the sole list entry. Empty group/kind fall
+// back to the CRD defaults so undefaulted objects still match.
 func ConvertFromV1Alpha2(in *v1alpha2.InferenceObjective) *InferenceObjective {
 	if in == nil {
 		return nil
 	}
 	out := &InferenceObjective{}
+	out.TypeMeta = in.TypeMeta
 	out.ObjectMeta = *in.ObjectMeta.DeepCopy()
 	if len(in.Status.Conditions) > 0 {
 		out.Status.Conditions = append([]metav1.Condition{}, in.Status.Conditions...)
@@ -38,10 +40,18 @@ func ConvertFromV1Alpha2(in *v1alpha2.InferenceObjective) *InferenceObjective {
 		priority := *in.Spec.Priority
 		out.Spec.Priority = &priority
 	}
+	group := Group(in.Spec.PoolRef.Group)
+	if group == "" {
+		group = "inference.networking.k8s.io"
+	}
+	kind := Kind(in.Spec.PoolRef.Kind)
+	if kind == "" {
+		kind = "InferencePool"
+	}
 	out.Spec.PoolRefs = []PoolObjectReference{
 		{
-			Group: Group(in.Spec.PoolRef.Group),
-			Kind:  Kind(in.Spec.PoolRef.Kind),
+			Group: group,
+			Kind:  kind,
 			Name:  ObjectName(in.Spec.PoolRef.Name),
 		},
 	}
@@ -50,12 +60,14 @@ func ConvertFromV1Alpha2(in *v1alpha2.InferenceObjective) *InferenceObjective {
 
 // ConvertToV1Alpha2 converts a v1 InferenceObjective to v1alpha2. Only the
 // first list entry survives; additional entries and the pool selector have
-// no v1alpha2 equivalent and are dropped.
+// no v1alpha2 equivalent and are dropped. Kept for tests only; the
+// controller never downgrades served objects.
 func ConvertToV1Alpha2(in *InferenceObjective) *v1alpha2.InferenceObjective {
 	if in == nil {
 		return nil
 	}
 	out := &v1alpha2.InferenceObjective{}
+	out.TypeMeta = in.TypeMeta
 	out.ObjectMeta = *in.ObjectMeta.DeepCopy()
 	if len(in.Status.Conditions) > 0 {
 		out.Status.Conditions = append([]metav1.Condition{}, in.Status.Conditions...)
@@ -67,9 +79,17 @@ func ConvertToV1Alpha2(in *InferenceObjective) *v1alpha2.InferenceObjective {
 	}
 	if len(in.Spec.PoolRefs) > 0 {
 		first := in.Spec.PoolRefs[0]
+		group := v1alpha2.Group(first.Group)
+		if group == "" {
+			group = "inference.networking.k8s.io"
+		}
+		kind := v1alpha2.Kind(first.Kind)
+		if kind == "" {
+			kind = "InferencePool"
+		}
 		out.Spec.PoolRef = v1alpha2.PoolObjectReference{
-			Group: v1alpha2.Group(first.Group),
-			Kind:  v1alpha2.Kind(first.Kind),
+			Group: group,
+			Kind:  kind,
 			Name:  v1alpha2.ObjectName(first.Name),
 		}
 	}

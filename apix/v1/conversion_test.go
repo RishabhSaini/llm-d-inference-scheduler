@@ -50,7 +50,7 @@ func TestConvertFromV1Alpha2(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "tier", Namespace: "ns"},
 				Spec: InferenceObjectiveSpec{
 					Priority: &priority,
-					PoolRefs: []PoolObjectReference{{Name: "pool1", Group: "inference.networking.k8s.io"}},
+					PoolRefs: []PoolObjectReference{{Name: "pool1", Group: "inference.networking.k8s.io", Kind: "InferencePool"}},
 				},
 			},
 		},
@@ -65,7 +65,7 @@ func TestConvertFromV1Alpha2(t *testing.T) {
 			want: &InferenceObjective{
 				ObjectMeta: metav1.ObjectMeta{Name: "tier", Namespace: "ns"},
 				Spec: InferenceObjectiveSpec{
-					PoolRefs: []PoolObjectReference{{Name: "pool1", Group: "inference.networking.k8s.io"}},
+					PoolRefs: []PoolObjectReference{{Name: "pool1", Group: "inference.networking.k8s.io", Kind: "InferencePool"}},
 				},
 			},
 		},
@@ -82,7 +82,24 @@ func TestConvertFromV1Alpha2(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "tier", Namespace: "ns"},
 				Spec: InferenceObjectiveSpec{
 					Priority: &priority,
-					PoolRefs: []PoolObjectReference{{Name: "pool1", Group: "inference.networking.x-k8s.io"}},
+					PoolRefs: []PoolObjectReference{{Name: "pool1", Group: "inference.networking.x-k8s.io", Kind: "InferencePool"}},
+				},
+			},
+		},
+		{
+			name: "empty group and kind default through conversion",
+			in: &v1alpha2.InferenceObjective{
+				ObjectMeta: metav1.ObjectMeta{Name: "tier", Namespace: "ns"},
+				Spec: v1alpha2.InferenceObjectiveSpec{
+					Priority: &priority,
+					PoolRef:  v1alpha2.PoolObjectReference{Name: "pool1"},
+				},
+			},
+			want: &InferenceObjective{
+				ObjectMeta: metav1.ObjectMeta{Name: "tier", Namespace: "ns"},
+				Spec: InferenceObjectiveSpec{
+					Priority: &priority,
+					PoolRefs: []PoolObjectReference{{Name: "pool1", Group: "inference.networking.k8s.io", Kind: "InferencePool"}},
 				},
 			},
 		},
@@ -136,7 +153,7 @@ func TestConvertToV1Alpha2(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "tier", Namespace: "ns"},
 				Spec: v1alpha2.InferenceObjectiveSpec{
 					Priority: &priority,
-					PoolRef:  v1alpha2.PoolObjectReference{Name: "pool1", Group: "inference.networking.k8s.io"},
+					PoolRef:  v1alpha2.PoolObjectReference{Name: "pool1", Group: "inference.networking.k8s.io", Kind: "InferencePool"},
 				},
 			},
 		},
@@ -233,11 +250,55 @@ func TestConversionRoundTrip(t *testing.T) {
 		Spec: InferenceObjectiveSpec{
 			Priority: &priority,
 			PoolRefs: []PoolObjectReference{
-				{Name: "pool1", Group: "inference.networking.k8s.io"},
+				{Name: "pool1", Group: "inference.networking.k8s.io", Kind: "InferencePool"},
 			},
 		},
 	}
 	if diff := cmp.Diff(original, ConvertFromV1Alpha2(ConvertToV1Alpha2(original))); diff != "" {
 		t.Errorf("round trip diff (-want/+got): %s", diff)
+	}
+}
+
+func TestConversionPreservesTypeMeta(t *testing.T) {
+	priority := int32(10)
+	alpha := &v1alpha2.InferenceObjective{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "llm-d.ai/v1alpha2", Kind: "InferenceObjective"},
+		ObjectMeta: metav1.ObjectMeta{Name: "tier", Namespace: "ns"},
+		Spec: v1alpha2.InferenceObjectiveSpec{
+			Priority: &priority,
+			PoolRef:  v1alpha2.PoolObjectReference{Name: "pool1", Group: "inference.networking.k8s.io", Kind: "InferencePool"},
+		},
+	}
+	if got := ConvertFromV1Alpha2(alpha); got.TypeMeta != alpha.TypeMeta {
+		t.Errorf("ConvertFromV1Alpha2() TypeMeta = %v, want %v", got.TypeMeta, alpha.TypeMeta)
+	}
+	v1obj := &InferenceObjective{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "llm-d.ai/v1", Kind: "InferenceObjective"},
+		ObjectMeta: metav1.ObjectMeta{Name: "tier", Namespace: "ns"},
+		Spec: InferenceObjectiveSpec{
+			Priority: &priority,
+			PoolRefs: []PoolObjectReference{{Name: "pool1", Group: "inference.networking.k8s.io", Kind: "InferencePool"}},
+		},
+	}
+	if got := ConvertToV1Alpha2(v1obj); got.TypeMeta != v1obj.TypeMeta {
+		t.Errorf("ConvertToV1Alpha2() TypeMeta = %v, want %v", got.TypeMeta, v1obj.TypeMeta)
+	}
+}
+
+func TestConvertToDefaultsEmptyGroupKind(t *testing.T) {
+	in := &InferenceObjective{
+		ObjectMeta: metav1.ObjectMeta{Name: "tier", Namespace: "ns"},
+		Spec: InferenceObjectiveSpec{
+			PoolRefs: []PoolObjectReference{{Name: "pool1"}},
+		},
+	}
+	want := &v1alpha2.InferenceObjective{
+		ObjectMeta: metav1.ObjectMeta{Name: "tier", Namespace: "ns"},
+		Spec: v1alpha2.InferenceObjectiveSpec{
+			PoolRef: v1alpha2.PoolObjectReference{Name: "pool1", Group: "inference.networking.k8s.io", Kind: "InferencePool"},
+		},
+	}
+	if diff := cmp.Diff(want, ConvertToV1Alpha2(in)); diff != "" {
+		t.Errorf("ConvertToV1Alpha2() empty defaults diff (-want/+got): %s", diff)
 	}
 }

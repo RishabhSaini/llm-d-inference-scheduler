@@ -138,6 +138,10 @@ func (c *InferenceObjectiveReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	// No served version targets this inferencePool.
+	logger.V(logutil.DEBUG).Info("Ignoring InferenceObjective without pool match",
+		"candidates", len(candidates),
+		"poolRefs", candidates[0].Spec.PoolRefs,
+		"poolSelector", candidates[0].Spec.PoolSelector)
 	c.Datastore.ObjectiveDelete(req.NamespacedName)
 	c.syncPriorityBands()
 	return ctrl.Result{}, nil

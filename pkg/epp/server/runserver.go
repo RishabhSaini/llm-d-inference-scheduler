@@ -144,9 +144,8 @@ func NewDefaultExtProcServerRunner() *ExtProcServerRunner {
 		startCrdReconcilers:       true,
 		hasInferenceObjective:     true,
 		hasInferenceModelRewrites: true,
-		InferenceObjectiveGV:      inferenceObjectiveV1GV,
+		InferenceObjectiveGV:      inferenceAPIGV,
 		InferenceModelRewriteGV:   inferenceAPIGV,
-		hasV1InferenceObjective:   true,
 	}, nil, nil, nil, nil, nil)
 }
 

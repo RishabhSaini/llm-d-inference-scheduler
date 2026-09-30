@@ -555,7 +555,7 @@ func (r errorPoolReader) Get(ctx context.Context, nn types.NamespacedName, obj c
 	return r.Reader.Get(ctx, nn, obj, opts...)
 }
 
-func testReconciler(ds datastore.Datastore, reader client.Reader, watchV1 bool) *InferenceObjectiveReconciler {
+func testReconciler(ds datastore.Datastore, reader client.Reader) *InferenceObjectiveReconciler {
 	return &InferenceObjectiveReconciler{
 		Reader:    reader,
 		Datastore: ds,
@@ -563,7 +563,7 @@ func testReconciler(ds datastore.Datastore, reader client.Reader, watchV1 bool) 
 			NamespacedName: types.NamespacedName{Name: inferencePool.Name, Namespace: inferencePool.Namespace},
 			GroupKind:      schema.GroupKind{Group: inferencePool.GroupVersionKind().Group, Kind: inferencePool.GroupVersionKind().Kind},
 		},
-		PrimaryV1: watchV1,
+		PrimaryV1: true,
 	}
 }
 
@@ -588,7 +588,7 @@ func TestInferenceObjectiveV1Deletion(t *testing.T) {
 		Build()
 	ds := datastore.NewDatastore(t.Context(), datalayer.NewTestRuntime(t, time.Second))
 	ds.ObjectiveSet(v1ObjectiveShared)
-	reconciler := testReconciler(ds, fakeClient, true)
+	reconciler := testReconciler(ds, fakeClient)
 	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: deleting.Name, Namespace: deleting.Namespace},
 	})
@@ -603,6 +603,43 @@ func TestInferenceObjectiveV1Deletion(t *testing.T) {
 	}
 }
 
+func TestInferenceObjectiveV1DeleteFallsBackToSecondary(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = v1alpha2.Install(scheme)
+	_ = apixv1.Install(scheme)
+	_ = v1.Install(scheme)
+	now := metav1.Now()
+	deleting := testutil.MakeV1InferenceObjective(infObjective1.Name).
+		Namespace(infObjective1.Namespace).
+		Priority(int32(9)).
+		PoolRefs(
+			apixv1.PoolObjectReference{Name: apixv1.ObjectName(inferencePool.Name), Group: apixv1.Group(routing.InferencePoolAPIGroup)},
+		).ObjRef()
+	deleting.DeletionTimestamp = &now
+	deleting.Finalizers = []string{"finalizer"}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(deleting, infObjective1).
+		Build()
+	ds := datastore.NewDatastore(t.Context(), datalayer.NewTestRuntime(t, time.Second))
+	reconciler := testReconciler(ds, fakeClient)
+	reconciler.WatchV1Alpha2 = true
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: infObjective1.Name, Namespace: infObjective1.Namespace},
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	got := ds.ObjectiveGet(infObjective1.Name)
+	if got == nil {
+		t.Fatal("expected secondary v1alpha2 to load after v1 delete")
+	}
+	if got.Spec.Priority == nil || *got.Spec.Priority != *infObjective1.Spec.Priority {
+		t.Errorf("expected fallback priority %v, got %v", infObjective1.Spec.Priority, got.Spec.Priority)
+	}
+}
+
 func TestInferenceObjectivePoolReadError(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
@@ -614,7 +651,7 @@ func TestInferenceObjectivePoolReadError(t *testing.T) {
 		WithObjects(v1ObjectiveSelector).
 		Build()
 	ds := datastore.NewDatastore(t.Context(), datalayer.NewTestRuntime(t, time.Second))
-	reconciler := testReconciler(ds, errorPoolReader{Reader: fakeClient}, true)
+	reconciler := testReconciler(ds, errorPoolReader{Reader: fakeClient})
 	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: v1ObjectiveSelector.Name, Namespace: v1ObjectiveSelector.Namespace},
 	})
@@ -655,7 +692,7 @@ func TestInferenceObjectiveBandsDefaultUnsetPriority(t *testing.T) {
 		Build()
 	ds := datastore.NewDatastore(t.Context(), datalayer.NewTestRuntime(t, time.Second))
 	bands := &recordingBands{}
-	reconciler := testReconciler(ds, fakeClient, true)
+	reconciler := testReconciler(ds, fakeClient)
 	reconciler.PriorityBandControlPlane = bands
 	for _, name := range []string{"plain", "prioritized"} {
 		_, err := reconciler.Reconcile(context.Background(), ctrl.Request{

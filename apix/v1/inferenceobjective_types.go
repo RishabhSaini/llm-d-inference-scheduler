@@ -22,7 +22,8 @@ import (
 )
 
 // InferenceObjective is the Schema for the InferenceObjectives API.
-// It serves as the storage version for multi-pool tier definitions.
+// It carries multi-pool tier definitions. Storage stays on v1alpha2 until
+// the serving migration lands.
 //
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
