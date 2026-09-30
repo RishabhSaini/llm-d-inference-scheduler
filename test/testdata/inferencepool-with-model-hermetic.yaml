@@ -15,63 +15,54 @@ spec:
     port:
       number: 9002
 ---
-apiVersion: llm-d.ai/v1alpha2
+apiVersion: llm-d.ai/v1
 kind: InferenceObjective
 metadata:
   name: sql-lora
   namespace: default
 spec:
   priority: 2
-  poolRef:
-    name: vllm-qwen3-32b-pool
-  targetModels:
-  - name: sql-lora-1fdg2
-    weight: 100
+  poolRefs:
+  - name: vllm-qwen3-32b-pool
 ---
-apiVersion: llm-d.ai/v1alpha2
+apiVersion: llm-d.ai/v1
 kind: InferenceObjective
 metadata:
   name: sql-lora-sheddable
   namespace: default
 spec:
-  poolRef:
-    name: vllm-qwen3-32b-pool
-  targetModels:
-  - name: sql-lora-1fdg3
-    weight: 100
+  poolRefs:
+  - name: vllm-qwen3-32b-pool
 ---
-apiVersion: llm-d.ai/v1alpha2
+apiVersion: llm-d.ai/v1
 kind: InferenceObjective
 metadata:
   name: my-model
   namespace: default
 spec:
   priority: 2
-  poolRef:
-    name: vllm-qwen3-32b-pool
-  targetModels:
-  - name: my-model-12345
-    weight: 100
+  poolRefs:
+  - name: vllm-qwen3-32b-pool
 ---
-apiVersion: llm-d.ai/v1alpha2
+apiVersion: llm-d.ai/v1
 kind: InferenceObjective
 metadata:
   name: direct-model
   namespace: default
 spec:
   priority: 2
-  poolRef:
-    name: vllm-qwen3-32b-pool   
+  poolRefs:
+  - name: vllm-qwen3-32b-pool
 ---
-apiVersion: llm-d.ai/v1alpha2
+apiVersion: llm-d.ai/v1
 kind: InferenceObjective
 metadata:
   name: inference-objective-with-priority-4
   namespace: default
 spec:
   priority: 4
-  poolRef:
-    name: vllm-qwen3-32b-pool
+  poolRefs:
+  - name: vllm-qwen3-32b-pool
 ---
 apiVersion: llm-d.ai/v1alpha2
 kind: InferenceModelRewrite
