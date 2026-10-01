@@ -153,9 +153,7 @@ func (f *sharedInformerFactory) Shutdown() {
 
 	// Will return immediately if there is nothing to wait for.
 	f.wg.Wait()
-	if f.informerName != nil {
-		f.informerName.Release()
-	}
+	f.informerName.Release()
 }
 
 func (f *sharedInformerFactory) WaitForCacheSync(stopCh <-chan struct{}) map[reflect.Type]bool {

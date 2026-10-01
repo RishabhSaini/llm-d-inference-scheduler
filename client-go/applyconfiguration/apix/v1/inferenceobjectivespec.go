@@ -27,11 +27,12 @@ type InferenceObjectiveSpecApplyConfiguration struct {
 	Priority *int32 `json:"priority,omitempty"`
 	// PoolRefs targets the inference pools in the same namespace that
 	// this objective applies to. An objective applies to a pool when any
-	// entry matches.
+	// entry matches. Entries are unique by pool name.
 	PoolRefs []PoolObjectReferenceApplyConfiguration `json:"poolRefs,omitempty"`
 	// PoolSelector selects inference pools in the same namespace by
-	// label. An objective applies to a pool when any entry matches. An
-	// empty selector matches every pool in the namespace.
+	// label. An objective applies to a pool when the selector matches
+	// its labels. The selector must not be empty; targeting every pool
+	// in the namespace is not a supported objective.
 	PoolSelector *metav1.LabelSelectorApplyConfiguration `json:"poolSelector,omitempty"`
 }
 

@@ -18,8 +18,10 @@ limitations under the License.
 package controller
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"maps"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -97,8 +99,6 @@ func (c *InferenceObjectiveReconciler) Reconcile(ctx context.Context, req ctrl.R
 				return ctrl.Result{}, fmt.Errorf("unable to get InferenceObjective - %w", err)
 			}
 		} else if legacy.DeletionTimestamp.IsZero() {
-			logger.V(logutil.VERBOSE).Info("DEPRECATION: llm-d.ai/v1alpha2/InferenceObjective is deprecated",
-				"replacement", "llm-d.ai/v1/InferenceObjective")
 			candidates = append(candidates, apixv1.ConvertFromV1Alpha2(legacy))
 		}
 	}
@@ -110,11 +110,11 @@ func (c *InferenceObjectiveReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, nil
 	}
 
-	poolLabels := map[string]string{}
+	var poolLabels map[string]string
 	for _, candidate := range candidates {
 		if candidate.Spec.PoolSelector != nil {
 			var err error
-			poolLabels, err = c.ownPoolLabels(ctx)
+			poolLabels, _, err = c.ownPoolLabels(ctx)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -122,7 +122,7 @@ func (c *InferenceObjectiveReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 	}
 	for _, current := range candidates {
-		if !matchesPool(current.Spec, c.PoolGKNN.Name, c.PoolGKNN.Group, poolLabels) {
+		if !matchesPool(current.Spec, c.PoolGKNN, poolLabels) {
 			continue
 		}
 		// Add or update the stored objective.
@@ -181,15 +181,14 @@ func (c *InferenceObjectiveReconciler) SetupWithManager(mgr ctrl.Manager) error 
 				if obj.GetName() != c.PoolGKNN.Name || obj.GetNamespace() != c.PoolGKNN.Namespace {
 					return nil
 				}
-				return c.objectivesWithSelector(ctx)
+				return c.objectivesForPool(ctx)
 			}),
+			builder.WithPredicates(poolEventPredicate),
 		)
 		if c.WatchV1Alpha2 {
 			b = b.Watches(
 				&v1alpha2.InferenceObjective{},
-				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
-					return []ctrl.Request{{NamespacedName: types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}}}
-				}),
+				&handler.EnqueueRequestForObject{},
 				builder.WithPredicates(predicate.Funcs{
 					CreateFunc: func(e event.CreateEvent) bool {
 						o, ok := e.Object.(*v1alpha2.InferenceObjective)
@@ -226,6 +225,17 @@ func (c *InferenceObjectiveReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		Complete(c)
 }
 
+// poolEventPredicate passes pool create events and label changes. Status
+// writes carry no label signal, and pool deletion does not requeue: the pool
+// reconciler clears the datastore, and recreation is covered by the create
+// event.
+var poolEventPredicate = predicate.Funcs{
+	CreateFunc:  func(event.CreateEvent) bool { return true },
+	UpdateFunc:  func(e event.UpdateEvent) bool { return !maps.Equal(e.ObjectOld.GetLabels(), e.ObjectNew.GetLabels()) },
+	DeleteFunc:  func(event.DeleteEvent) bool { return false },
+	GenericFunc: func(event.GenericEvent) bool { return false },
+}
+
 // eventPredicateV1 is a coarse pre-filter on v1 objective events. Selector
 // bearing objectives always pass; Reconcile re-evaluates against the pool
 // labels authoritatively.
@@ -233,27 +243,34 @@ func (c *InferenceObjectiveReconciler) eventPredicateV1(infObjective *apixv1.Inf
 	if infObjective.Spec.PoolSelector != nil {
 		return true
 	}
-	return matchesPoolRefs(infObjective.Spec, c.PoolGKNN.Name, c.PoolGKNN.Group)
+	return matchesPoolRefs(infObjective.Spec, c.PoolGKNN)
 }
 
 func (c *InferenceObjectiveReconciler) eventPredicate(infObjective *v1alpha2.InferenceObjective) bool {
 	return string(infObjective.Spec.PoolRef.Name) == c.PoolGKNN.Name && string(infObjective.Spec.PoolRef.Group) == c.PoolGKNN.Group
 }
 
-func matchesPoolRefs(spec apixv1.InferenceObjectiveSpec, poolName, poolGroup string) bool {
+// matchesPoolRefs reports whether any list entry targets the pool. An empty
+// entry kind falls back to the CRD default so undefaulted objects still
+// match.
+func matchesPoolRefs(spec apixv1.InferenceObjectiveSpec, pool common.GKNN) bool {
 	for _, ref := range spec.PoolRefs {
-		if string(ref.Name) == poolName && string(ref.Group) == poolGroup {
+		if string(ref.Name) == pool.Name && string(ref.Group) == pool.Group &&
+			string(cmp.Or(ref.Kind, "InferencePool")) == pool.Kind {
 			return true
 		}
 	}
 	return false
 }
 
-func matchesPool(spec apixv1.InferenceObjectiveSpec, poolName, poolGroup string, poolLabels map[string]string) bool {
-	if matchesPoolRefs(spec, poolName, poolGroup) {
+// matchesPool reports whether the spec targets the pool by list entry or
+// selector. A nil poolLabels means the pool is missing and selector
+// matching fails closed.
+func matchesPool(spec apixv1.InferenceObjectiveSpec, pool common.GKNN, poolLabels map[string]string) bool {
+	if matchesPoolRefs(spec, pool) {
 		return true
 	}
-	if spec.PoolSelector == nil {
+	if spec.PoolSelector == nil || poolLabels == nil {
 		return false
 	}
 	sel, err := metav1.LabelSelectorAsSelector(spec.PoolSelector)
@@ -263,30 +280,35 @@ func matchesPool(spec apixv1.InferenceObjectiveSpec, poolName, poolGroup string,
 	return sel.Matches(labels.Set(poolLabels))
 }
 
-// ownPoolLabels returns the labels of this controller's pool. A missing
-// pool yields empty labels; other errors propagate for requeue.
-func (c *InferenceObjectiveReconciler) ownPoolLabels(ctx context.Context) (map[string]string, error) {
+// ownPoolLabels returns the labels of this controller's pool and whether
+// the pool exists. A missing pool yields nil labels so selector matching
+// fails closed; other errors propagate for requeue.
+func (c *InferenceObjectiveReconciler) ownPoolLabels(ctx context.Context) (map[string]string, bool, error) {
 	pool := &v1.InferencePool{}
 	if err := c.Get(ctx, types.NamespacedName{Name: c.PoolGKNN.Name, Namespace: c.PoolGKNN.Namespace}, pool); err != nil {
 		if errors.IsNotFound(err) {
-			return map[string]string{}, nil
+			return nil, false, nil
 		}
-		return nil, fmt.Errorf("unable to get InferencePool - %w", err)
+		return nil, false, fmt.Errorf("unable to get InferencePool - %w", err)
 	}
-	return pool.Labels, nil
+	if pool.Labels == nil {
+		return map[string]string{}, true, nil
+	}
+	return pool.Labels, true, nil
 }
 
-// objectivesWithSelector lists namespaced v1 objectives carrying a pool
-// selector, for re-reconciliation when the own pool changes.
-func (c *InferenceObjectiveReconciler) objectivesWithSelector(ctx context.Context) []ctrl.Request {
+// objectivesForPool lists namespaced v1 objectives targeting this pool by
+// selector or list entry, for re-reconciliation when the pool is created or
+// its labels change.
+func (c *InferenceObjectiveReconciler) objectivesForPool(ctx context.Context) []ctrl.Request {
 	var reqs []ctrl.Request
-	v1list := &apixv1.InferenceObjectiveList{}
-	if err := c.List(ctx, v1list, client.InNamespace(c.PoolGKNN.Namespace)); err != nil {
-		log.FromContext(ctx).V(logutil.DEBUG).Info("Unable to list v1 InferenceObjectives for pool requeue", "error", err)
+	list := &apixv1.InferenceObjectiveList{}
+	if err := c.List(ctx, list, client.InNamespace(c.PoolGKNN.Namespace)); err != nil {
+		log.FromContext(ctx).Error(err, "Unable to list v1 InferenceObjectives for pool requeue")
 		return nil
 	}
-	for _, obj := range v1list.Items {
-		if obj.Spec.PoolSelector != nil {
+	for _, obj := range list.Items {
+		if obj.Spec.PoolSelector != nil || matchesPoolRefs(obj.Spec, c.PoolGKNN) {
 			reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{Name: obj.Name, Namespace: obj.Namespace}})
 		}
 	}

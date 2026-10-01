@@ -26,6 +26,7 @@ import (
 // the serving migration lands.
 //
 // +kubebuilder:object:root=true
+// +kubebuilder:unservedversion
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Inference Pools",type=string,JSONPath=`.spec.poolRefs[*].name`
 // +kubebuilder:printcolumn:name="Priority",type=string,JSONPath=`.spec.priority`
@@ -50,6 +51,8 @@ type InferenceObjectiveList struct {
 
 // InferenceObjectiveSpec represents the desired state of a specific model use case. This resource is
 // managed by the "Inference Workload Owner" persona.
+//
+// +kubebuilder:validation:XValidation:message="either poolRefs or poolSelector must be set",rule="has(self.poolRefs) || has(self.poolSelector)"
 type InferenceObjectiveSpec struct {
 
 	// Priority defines how important it is to serve the request compared to other requests in the same pool.
@@ -69,18 +72,22 @@ type InferenceObjectiveSpec struct {
 
 	// PoolRefs targets the inference pools in the same namespace that
 	// this objective applies to. An objective applies to a pool when any
-	// entry matches. An object with neither PoolRefs nor PoolSelector
-	// is ignored by every pool.
+	// entry matches. Entries are unique by pool name.
 	//
 	// +optional
 	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	// +listType=map
+	// +listMapKey=name
 	PoolRefs []PoolObjectReference `json:"poolRefs,omitempty"`
 
 	// PoolSelector selects inference pools in the same namespace by
 	// label. An objective applies to a pool when the selector matches
-	// its labels. An empty selector matches every pool in the namespace.
+	// its labels. The selector must not be empty; targeting every pool
+	// in the namespace is not a supported objective.
 	//
 	// +optional
+	// +kubebuilder:validation:XValidation:message="poolSelector must not be empty",rule="(has(self.matchLabels) && size(self.matchLabels) > 0) || (has(self.matchExpressions) && size(self.matchExpressions) > 0)"
 	PoolSelector *metav1.LabelSelector `json:"poolSelector,omitempty"`
 }
 
@@ -96,6 +103,5 @@ type InferenceObjectiveStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	// +kubebuilder:validation:MaxItems=8
-	// +kubebuilder:default={{type: "Ready", status: "Unknown", reason:"Pending", message:"Waiting for controller", lastTransitionTime: "1970-01-01T00:00:00Z"}}
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }

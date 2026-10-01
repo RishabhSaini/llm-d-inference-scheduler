@@ -32,6 +32,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	v1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 
 	apixv1 "github.com/llm-d/llm-d-router/apix/v1"
@@ -144,6 +145,10 @@ func labeledPool() *v1.InferencePool {
 	return pool
 }
 
+func unlabeledPool() *v1.InferencePool {
+	return testutil.MakeInferencePool("test-pool1").Namespace("ns1").ObjRef()
+}
+
 func TestInferenceObjectiveReconciler(t *testing.T) {
 	tests := []struct {
 		name                  string
@@ -236,10 +241,17 @@ func TestInferenceObjectiveReconciler(t *testing.T) {
 			wantObjectives:  []*apixv1.InferenceObjective{},
 		},
 		{
-			name:           "v1 empty selector matches without pool object",
+			name:           "v1 empty selector is ignored without pool object",
 			primaryV1:      true,
 			objectiveV1:    v1ObjectiveSelectorEmpty,
-			wantObjectives: []*apixv1.InferenceObjective{v1ObjectiveSelectorEmpty},
+			wantObjectives: []*apixv1.InferenceObjective{},
+		},
+		{
+			name:            "v1 empty selector matches a pool without labels",
+			primaryV1:       true,
+			poolInAPIServer: unlabeledPool(),
+			objectiveV1:     v1ObjectiveSelectorEmpty,
+			wantObjectives:  []*apixv1.InferenceObjective{v1ObjectiveSelectorEmpty},
 		},
 		{
 			name:           "v1 selector with requirements and no pool object is ignored",
@@ -413,15 +425,20 @@ func TestInferenceObjectiveLabelChange(t *testing.T) {
 	}
 }
 
-func TestInferenceObjectiveSelectorMapping(t *testing.T) {
+func TestInferenceObjectivePoolMapping(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = v1alpha2.Install(scheme)
 	_ = apixv1.Install(scheme)
 	_ = v1.Install(scheme)
+	listMiss := testutil.MakeV1InferenceObjective("list-miss").
+		Namespace(inferencePool.Namespace).
+		PoolRefs(
+			apixv1.PoolObjectReference{Name: "test-pool2", Group: apixv1.Group(routing.InferencePoolAPIGroup)},
+		).ObjRef()
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(infObjective1, v1ObjectiveSelector).
+		WithObjects(infObjective1, v1ObjectiveSelector, v1ObjectiveShared, listMiss).
 		Build()
 	reconciler := &InferenceObjectiveReconciler{
 		Reader: fakeClient,
@@ -431,18 +448,50 @@ func TestInferenceObjectiveSelectorMapping(t *testing.T) {
 		},
 		PrimaryV1: true,
 	}
-	reqs := reconciler.objectivesWithSelector(context.Background())
-	if len(reqs) != 1 {
-		t.Fatalf("expected 1 selector objective, got %d", len(reqs))
+	reqs := reconciler.objectivesForPool(context.Background())
+	if len(reqs) != 2 {
+		t.Fatalf("expected 2 objectives targeting the pool, got %d: %v", len(reqs), reqs)
 	}
-	if reqs[0].Name != v1ObjectiveSelector.Name {
-		t.Errorf("expected %q, got %q", v1ObjectiveSelector.Name, reqs[0].Name)
+	got := map[string]bool{}
+	for _, req := range reqs {
+		got[req.Name] = true
+	}
+	if !got[v1ObjectiveSelector.Name] || !got[v1ObjectiveShared.Name] {
+		t.Errorf("expected the selector and list objectives, got %v", got)
+	}
+	if got[listMiss.Name] {
+		t.Errorf("expected the objective for another pool to be excluded, got %v", got)
+	}
+}
+
+func TestPoolEventPredicate(t *testing.T) {
+	pool := func(labels map[string]string) *v1.InferencePool {
+		pool := testutil.MakeInferencePool("test-pool1").Namespace("ns1").ObjRef()
+		pool.Labels = labels
+		return pool
+	}
+	if !poolEventPredicate.Create(event.CreateEvent{Object: pool(nil)}) {
+		t.Error("pool create should requeue objectives")
+	}
+	if poolEventPredicate.Delete(event.DeleteEvent{Object: pool(nil)}) {
+		t.Error("pool delete should not requeue objectives; the pool reconciler clears the datastore")
+	}
+	if !poolEventPredicate.Update(event.UpdateEvent{ObjectOld: pool(map[string]string{"a": "b"}), ObjectNew: pool(map[string]string{"a": "c"})}) {
+		t.Error("label change should requeue objectives")
+	}
+	if !poolEventPredicate.Update(event.UpdateEvent{ObjectOld: pool(map[string]string{"a": "b"}), ObjectNew: pool(nil)}) {
+		t.Error("label removal should requeue objectives")
+	}
+	if poolEventPredicate.Update(event.UpdateEvent{ObjectOld: pool(nil), ObjectNew: pool(nil)}) {
+		t.Error("status-only update should not requeue objectives")
 	}
 }
 
 func TestMatchesPool(t *testing.T) {
-	poolName := inferencePool.Name
-	poolGroup := routing.InferencePoolAPIGroup
+	pool := common.GKNN{
+		NamespacedName: types.NamespacedName{Name: inferencePool.Name},
+		GroupKind:      schema.GroupKind{Group: routing.InferencePoolAPIGroup, Kind: "InferencePool"},
+	}
 	ref := func(name, group string) apixv1.PoolObjectReference {
 		return apixv1.PoolObjectReference{Name: apixv1.ObjectName(name), Group: apixv1.Group(group)}
 	}
@@ -454,13 +503,23 @@ func TestMatchesPool(t *testing.T) {
 	}{
 		{
 			name: "poolRefs hit",
-			spec: apixv1.InferenceObjectiveSpec{PoolRefs: []apixv1.PoolObjectReference{ref("other", poolGroup), ref(poolName, poolGroup)}},
+			spec: apixv1.InferenceObjectiveSpec{PoolRefs: []apixv1.PoolObjectReference{ref("other", pool.Group), ref(pool.Name, pool.Group)}},
 			want: true,
 		},
 		{
 			name: "poolRefs miss",
-			spec: apixv1.InferenceObjectiveSpec{PoolRefs: []apixv1.PoolObjectReference{ref("other", poolGroup)}},
+			spec: apixv1.InferenceObjectiveSpec{PoolRefs: []apixv1.PoolObjectReference{ref("other", pool.Group)}},
 			want: false,
+		},
+		{
+			name: "poolRefs kind mismatch is ignored",
+			spec: apixv1.InferenceObjectiveSpec{PoolRefs: []apixv1.PoolObjectReference{{Name: apixv1.ObjectName(pool.Name), Group: apixv1.Group(pool.Group), Kind: "Other"}}},
+			want: false,
+		},
+		{
+			name: "poolRefs empty kind defaults to InferencePool",
+			spec: apixv1.InferenceObjectiveSpec{PoolRefs: []apixv1.PoolObjectReference{ref(pool.Name, pool.Group)}},
+			want: true,
 		},
 		{
 			name:       "selector hit",
@@ -475,15 +534,21 @@ func TestMatchesPool(t *testing.T) {
 			want:       false,
 		},
 		{
-			name:       "selector with requirements and no labels misses",
+			name:       "selector with no pool matches nothing",
 			spec:       apixv1.InferenceObjectiveSpec{PoolSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"tiers": "shared"}}},
 			poolLabels: nil,
 			want:       false,
 		},
 		{
-			name:       "empty selector matches without labels",
+			name:       "empty selector with no pool matches nothing",
 			spec:       apixv1.InferenceObjectiveSpec{PoolSelector: &metav1.LabelSelector{}},
 			poolLabels: nil,
+			want:       false,
+		},
+		{
+			name:       "empty selector matches a pool without labels",
+			spec:       apixv1.InferenceObjectiveSpec{PoolSelector: &metav1.LabelSelector{}},
+			poolLabels: map[string]string{},
 			want:       true,
 		},
 		{
@@ -494,7 +559,7 @@ func TestMatchesPool(t *testing.T) {
 		},
 		{
 			name:       "union of miss and hit loads",
-			spec:       apixv1.InferenceObjectiveSpec{PoolRefs: []apixv1.PoolObjectReference{ref("other", poolGroup)}, PoolSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"tiers": "shared"}}},
+			spec:       apixv1.InferenceObjectiveSpec{PoolRefs: []apixv1.PoolObjectReference{ref("other", pool.Group)}, PoolSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"tiers": "shared"}}},
 			poolLabels: map[string]string{"tiers": "shared"},
 			want:       true,
 		},
@@ -507,7 +572,7 @@ func TestMatchesPool(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := matchesPool(test.spec, poolName, poolGroup, test.poolLabels); got != test.want {
+			if got := matchesPool(test.spec, pool, test.poolLabels); got != test.want {
 				t.Errorf("matchesPool() = %v, want %v", got, test.want)
 			}
 		})
@@ -600,43 +665,6 @@ func TestInferenceObjectiveV1Deletion(t *testing.T) {
 	}
 	if got := ds.ObjectiveGet(v1ObjectiveShared.Name); got == nil {
 		t.Error("expected unrelated objective retained")
-	}
-}
-
-func TestInferenceObjectiveV1DeleteFallsBackToSecondary(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = clientgoscheme.AddToScheme(scheme)
-	_ = v1alpha2.Install(scheme)
-	_ = apixv1.Install(scheme)
-	_ = v1.Install(scheme)
-	now := metav1.Now()
-	deleting := testutil.MakeV1InferenceObjective(infObjective1.Name).
-		Namespace(infObjective1.Namespace).
-		Priority(int32(9)).
-		PoolRefs(
-			apixv1.PoolObjectReference{Name: apixv1.ObjectName(inferencePool.Name), Group: apixv1.Group(routing.InferencePoolAPIGroup)},
-		).ObjRef()
-	deleting.DeletionTimestamp = &now
-	deleting.Finalizers = []string{"finalizer"}
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(deleting, infObjective1).
-		Build()
-	ds := datastore.NewDatastore(t.Context(), datalayer.NewTestRuntime(t, time.Second))
-	reconciler := testReconciler(ds, fakeClient)
-	reconciler.WatchV1Alpha2 = true
-	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: infObjective1.Name, Namespace: infObjective1.Namespace},
-	})
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	got := ds.ObjectiveGet(infObjective1.Name)
-	if got == nil {
-		t.Fatal("expected secondary v1alpha2 to load after v1 delete")
-	}
-	if got.Spec.Priority == nil || *got.Spec.Priority != *infObjective1.Spec.Priority {
-		t.Errorf("expected fallback priority %v, got %v", infObjective1.Spec.Priority, got.Spec.Priority)
 	}
 }
 

@@ -33,6 +33,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apixv1 "github.com/llm-d/llm-d-router/apix/v1"
@@ -187,7 +188,7 @@ func (d *Director) getInferenceObjective(ctx context.Context, reqCtx *handlers.R
 		// The API defines an unset priority as 0. Copy before defaulting:
 		// stored objectives are shared with concurrent readers.
 		copied := *infObjective
-		copied.Spec.Priority = &d.defaultPriority
+		copied.Spec.Priority = ptr.To(int32(0))
 		infObjective = &copied
 	}
 	return infObjective

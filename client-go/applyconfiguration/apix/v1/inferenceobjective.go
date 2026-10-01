@@ -12,9 +12,8 @@ import (
 // with apply.
 //
 // InferenceObjective is the Schema for the InferenceObjectives API.
-// Serving starts with the conversion strategy agreed for the v1 promotion;
-// until then v1alpha2 stays the storage version and v1 requests are not
-// served.
+// It carries multi-pool tier definitions. Storage stays on v1alpha2 until
+// the serving migration lands.
 type InferenceObjectiveApplyConfiguration struct {
 	metav1.TypeMetaApplyConfiguration    `json:",inline"`
 	*metav1.ObjectMetaApplyConfiguration `json:"metadata,omitempty"`

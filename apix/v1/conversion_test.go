@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/llm-d/llm-d-router/apix/v1alpha2"
@@ -103,10 +104,23 @@ func TestConvertFromV1Alpha2(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "empty reference name yields no list entries",
+			in: &v1alpha2.InferenceObjective{
+				ObjectMeta: metav1.ObjectMeta{Name: "tier", Namespace: "ns"},
+				Spec: v1alpha2.InferenceObjectiveSpec{
+					PoolRef: v1alpha2.PoolObjectReference{Group: "inference.networking.k8s.io"},
+				},
+			},
+			want: &InferenceObjective{
+				ObjectMeta: metav1.ObjectMeta{Name: "tier", Namespace: "ns"},
+				Spec:       InferenceObjectiveSpec{},
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if diff := cmp.Diff(test.want, ConvertFromV1Alpha2(test.in)); diff != "" {
+			if diff := cmp.Diff(test.want, ConvertFromV1Alpha2(test.in), cmpopts.IgnoreFields(InferenceObjective{}, "TypeMeta")); diff != "" {
 				t.Errorf("ConvertFromV1Alpha2() diff (-want/+got): %s", diff)
 			}
 		})
@@ -157,10 +171,28 @@ func TestConvertToV1Alpha2(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "unnamed list entries are skipped",
+			in: &InferenceObjective{
+				ObjectMeta: metav1.ObjectMeta{Name: "tier", Namespace: "ns"},
+				Spec: InferenceObjectiveSpec{
+					PoolRefs: []PoolObjectReference{
+						{Group: "inference.networking.k8s.io"},
+						{Name: "pool2", Group: "inference.networking.k8s.io"},
+					},
+				},
+			},
+			want: &v1alpha2.InferenceObjective{
+				ObjectMeta: metav1.ObjectMeta{Name: "tier", Namespace: "ns"},
+				Spec: v1alpha2.InferenceObjectiveSpec{
+					PoolRef: v1alpha2.PoolObjectReference{Name: "pool2", Group: "inference.networking.k8s.io", Kind: "InferencePool"},
+				},
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if diff := cmp.Diff(test.want, ConvertToV1Alpha2(test.in)); diff != "" {
+			if diff := cmp.Diff(test.want, ConvertToV1Alpha2(test.in), cmpopts.IgnoreFields(v1alpha2.InferenceObjective{}, "TypeMeta")); diff != "" {
 				t.Errorf("ConvertToV1Alpha2() diff (-want/+got): %s", diff)
 			}
 		})
@@ -246,6 +278,7 @@ func TestConvertToDoesNotAliasInput(t *testing.T) {
 func TestConversionRoundTrip(t *testing.T) {
 	priority := int32(10)
 	original := &InferenceObjective{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "llm-d.ai/v1", Kind: "InferenceObjective"},
 		ObjectMeta: metav1.ObjectMeta{Name: "tier", Namespace: "ns"},
 		Spec: InferenceObjectiveSpec{
 			Priority: &priority,
@@ -259,7 +292,7 @@ func TestConversionRoundTrip(t *testing.T) {
 	}
 }
 
-func TestConversionPreservesTypeMeta(t *testing.T) {
+func TestConversionSetsTargetTypeMeta(t *testing.T) {
 	priority := int32(10)
 	alpha := &v1alpha2.InferenceObjective{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "llm-d.ai/v1alpha2", Kind: "InferenceObjective"},
@@ -269,8 +302,9 @@ func TestConversionPreservesTypeMeta(t *testing.T) {
 			PoolRef:  v1alpha2.PoolObjectReference{Name: "pool1", Group: "inference.networking.k8s.io", Kind: "InferencePool"},
 		},
 	}
-	if got := ConvertFromV1Alpha2(alpha); got.TypeMeta != alpha.TypeMeta {
-		t.Errorf("ConvertFromV1Alpha2() TypeMeta = %v, want %v", got.TypeMeta, alpha.TypeMeta)
+	wantV1 := metav1.TypeMeta{APIVersion: "llm-d.ai/v1", Kind: "InferenceObjective"}
+	if got := ConvertFromV1Alpha2(alpha); got.TypeMeta != wantV1 {
+		t.Errorf("ConvertFromV1Alpha2() TypeMeta = %v, want %v", got.TypeMeta, wantV1)
 	}
 	v1obj := &InferenceObjective{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "llm-d.ai/v1", Kind: "InferenceObjective"},
@@ -280,8 +314,9 @@ func TestConversionPreservesTypeMeta(t *testing.T) {
 			PoolRefs: []PoolObjectReference{{Name: "pool1", Group: "inference.networking.k8s.io", Kind: "InferencePool"}},
 		},
 	}
-	if got := ConvertToV1Alpha2(v1obj); got.TypeMeta != v1obj.TypeMeta {
-		t.Errorf("ConvertToV1Alpha2() TypeMeta = %v, want %v", got.TypeMeta, v1obj.TypeMeta)
+	wantAlpha := metav1.TypeMeta{APIVersion: "llm-d.ai/v1alpha2", Kind: "InferenceObjective"}
+	if got := ConvertToV1Alpha2(v1obj); got.TypeMeta != wantAlpha {
+		t.Errorf("ConvertToV1Alpha2() TypeMeta = %v, want %v", got.TypeMeta, wantAlpha)
 	}
 }
 
@@ -298,7 +333,7 @@ func TestConvertToDefaultsEmptyGroupKind(t *testing.T) {
 			PoolRef: v1alpha2.PoolObjectReference{Name: "pool1", Group: "inference.networking.k8s.io", Kind: "InferencePool"},
 		},
 	}
-	if diff := cmp.Diff(want, ConvertToV1Alpha2(in)); diff != "" {
+	if diff := cmp.Diff(want, ConvertToV1Alpha2(in), cmpopts.IgnoreFields(v1alpha2.InferenceObjective{}, "TypeMeta")); diff != "" {
 		t.Errorf("ConvertToV1Alpha2() empty defaults diff (-want/+got): %s", diff)
 	}
 }
