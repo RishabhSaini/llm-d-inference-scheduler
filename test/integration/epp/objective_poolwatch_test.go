@@ -38,11 +38,13 @@ import (
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	crconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	v1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 
 	apixv1 "github.com/llm-d/llm-d-router/apix/v1"
+	"github.com/llm-d/llm-d-router/apix/v1alpha2"
 	"github.com/llm-d/llm-d-router/pkg/common"
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/epp/controller"
@@ -51,10 +53,11 @@ import (
 	testutil "github.com/llm-d/llm-d-router/pkg/epp/util/testing"
 )
 
-// startObjectiveV1Env boots an envtest environment serving the gaie v1
-// InferencePool CRD and the v1-only InferenceObjective CRD under
-// testdata/crd. The shipped CRD serves v1alpha2 only.
-func startObjectiveV1Env(t *testing.T) *rest.Config {
+// startObjectiveEnv boots an envtest environment serving the gaie v1
+// InferencePool CRD and an InferenceObjective CRD from the given testdata
+// subdirectory: "crd" serves v1 only, "crd-dual" serves v1alpha2 and v1
+// with None conversion. The shipped CRD serves v1alpha2 only.
+func startObjectiveEnv(t *testing.T, crdDir string) *rest.Config {
 	t.Helper()
 	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}",
 		"sigs.k8s.io/gateway-api-inference-extension").Output()
@@ -64,7 +67,7 @@ func startObjectiveV1Env(t *testing.T) *rest.Config {
 	env := &envtest.Environment{
 		CRDDirectoryPaths: []string{
 			filepath.Join(gaieModulePath, "config", "crd", "bases"),
-			filepath.Join(repoRootPath, "test", "integration", "epp", "testdata", "crd"),
+			filepath.Join(repoRootPath, "test", "integration", "epp", "testdata", crdDir),
 		},
 		ErrorIfCRDPathMissing: true,
 	}
@@ -79,16 +82,18 @@ func startObjectiveV1Env(t *testing.T) *rest.Config {
 // change or pool creation must re-reconcile objectives whose poolSelector
 // matches the pool, so datastore entries follow the pool's labels.
 func TestInferenceObjectivePoolWatchWiring(t *testing.T) {
-	cfg := startObjectiveV1Env(t)
+	cfg := startObjectiveEnv(t, "crd")
 
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(apixv1.Install(scheme))
 	utilruntime.Must(v1.Install(scheme))
 
+	skipNameValidation := true
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:  scheme,
-		Metrics: metricsserver.Options{BindAddress: "0"},
+		Scheme:     scheme,
+		Metrics:    metricsserver.Options{BindAddress: "0"},
+		Controller: crconfig.Controller{SkipNameValidation: &skipNameValidation},
 	})
 	require.NoError(t, err, "failed to create manager")
 
@@ -188,7 +193,7 @@ func TestInferenceObjectivePoolWatchWiring(t *testing.T) {
 // blanket-match every pool in the namespace. The reconciler does not
 // re-check this; admission is the single enforcement point.
 func TestInferenceObjectiveEmptySelectorRejected(t *testing.T) {
-	cfg := startObjectiveV1Env(t)
+	cfg := startObjectiveEnv(t, "crd")
 
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -218,4 +223,210 @@ func TestInferenceObjectiveEmptySelectorRejected(t *testing.T) {
 			require.True(t, errors.IsNotFound(err), "rejected objective must not be stored")
 		})
 	}
+}
+
+// TestInferenceObjectiveDualVersionWiring verifies the WatchV1Alpha2 path
+// against a real API server serving both versions with None conversion and
+// v1alpha2 storage. v1alpha2-written objectives load through the secondary
+// watch and are converted at the edge. v1-written objectives cannot work in
+// this state: with None conversion the API server prunes stored objects
+// against the storage version's schema, stripping poolRefs and poolSelector,
+// so a v1 create silently stores an objective that targets nothing. This is
+// why dual serving requires a conversion webhook (or a storage-version
+// switch with object recreation) before v1 can serve.
+func TestInferenceObjectiveDualVersionWiring(t *testing.T) {
+	cfg := startObjectiveEnv(t, "crd-dual")
+
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(v1alpha2.Install(scheme))
+	utilruntime.Must(apixv1.Install(scheme))
+	utilruntime.Must(v1.Install(scheme))
+
+	skipNameValidation := true
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:     scheme,
+		Metrics:    metricsserver.Options{BindAddress: "0"},
+		Controller: crconfig.Controller{SkipNameValidation: &skipNameValidation},
+	})
+	require.NoError(t, err, "failed to create manager")
+
+	poolName := "dual-watch-pool"
+	namespace := "dual-watch-" + uuid.NewString()[:8]
+
+	ds := datastore.NewDatastore(t.Context(), datalayer.NewTestRuntime(t, time.Second))
+	reconciler := &controller.InferenceObjectiveReconciler{
+		Datastore: ds,
+		Reader:    mgr.GetClient(),
+		PoolGKNN: common.GKNN{
+			NamespacedName: types.NamespacedName{Name: poolName, Namespace: namespace},
+			GroupKind:      schema.GroupKind{Group: routing.InferencePoolAPIGroup, Kind: "InferencePool"},
+		},
+		RunOnNonLeaders: true,
+		PrimaryV1:       true,
+		WatchV1Alpha2:   true,
+	}
+	require.NoError(t, reconciler.SetupWithManager(mgr), "failed to set up reconciler")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	mgrErr := make(chan error, 1)
+	go func() { mgrErr <- mgr.Start(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-mgrErr; err != nil && !strings.Contains(err.Error(), "context canceled") {
+			t.Errorf("manager stopped unexpectedly: %v", err)
+		}
+	})
+
+	directClient, err := client.New(cfg, client.Options{Scheme: scheme})
+	require.NoError(t, err, "failed to create direct client")
+	require.NoError(t, directClient.Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: namespace},
+	}))
+
+	pool := testutil.MakeInferencePool(poolName).
+		Namespace(namespace).
+		Selector(map[string]string{"app": poolName}).
+		EndpointPickerRef("epp").
+		TargetPorts(8000).
+		ObjRef()
+	pool.Spec.EndpointPickerRef.Port = &v1.Port{Number: v1.PortNumber(9002)}
+	require.NoError(t, directClient.Create(ctx, pool), "failed to create pool")
+
+	// A v1alpha2-written objective reaches the datastore through the
+	// secondary watch, converted to the v1 shape with the poolRef mapped
+	// to a single poolRefs entry.
+	legacyObjective := testutil.MakeInferenceObjective("legacy-objective").
+		Namespace(namespace).
+		Priority(int32(2)).
+		PoolName(poolName).
+		PoolGroup(routing.InferencePoolAPIGroup).
+		ObjRef()
+	require.NoError(t, directClient.Create(ctx, legacyObjective), "failed to create v1alpha2 objective")
+	require.Eventually(t, func() bool { return ds.ObjectiveGet("legacy-objective") != nil },
+		15*time.Second, 50*time.Millisecond, "v1alpha2 objective was not loaded through the secondary watch")
+	got := ds.ObjectiveGet("legacy-objective")
+	require.NotNil(t, got.Spec.Priority)
+	require.Equal(t, int32(2), *got.Spec.Priority, "converted objective must keep its priority")
+	require.Len(t, got.Spec.PoolRefs, 1, "converted objective must target one pool")
+
+	// Both watches observe the same object (one object, two views); the
+	// datastore must hold exactly one entry.
+	require.Eventually(t, func() bool { return len(ds.ObjectiveGetAll()) == 1 },
+		15*time.Second, 50*time.Millisecond, "expected exactly one datastore entry, got %d", len(ds.ObjectiveGetAll()))
+
+	// A v1-written objective is accepted by the API server but its
+	// targeting is stripped at storage, so it never loads.
+	v1Objective := testutil.MakeV1InferenceObjective("v1-objective").
+		Namespace(namespace).
+		Priority(int32(3)).
+		PoolRefs(apixv1.PoolObjectReference{Name: apixv1.ObjectName(poolName), Group: apixv1.Group(routing.InferencePoolAPIGroup)}).
+		ObjRef()
+	require.NoError(t, directClient.Create(ctx, v1Objective), "failed to create v1 objective")
+	stored := &apixv1.InferenceObjective{}
+	require.NoError(t, directClient.Get(ctx, types.NamespacedName{Name: "v1-objective", Namespace: namespace}, stored))
+	require.Empty(t, stored.Spec.PoolRefs, "None conversion must strip v1 fields under v1alpha2 storage")
+	require.Never(t, func() bool { return ds.ObjectiveGet("v1-objective") != nil },
+		3*time.Second, 100*time.Millisecond, "stripped v1 objective must not enter the datastore")
+
+	require.NoError(t, directClient.Delete(ctx, legacyObjective))
+	require.Eventually(t, func() bool { return ds.ObjectiveGet("legacy-objective") == nil },
+		15*time.Second, 50*time.Millisecond, "deleted v1alpha2 objective was not removed")
+}
+
+// TestInferenceObjectiveDualVersionV1StorageWiring verifies the same
+// dual-serving setup with v1 as the storage version: v1-written objectives
+// are fully functional through the primary watch, and the v1alpha2 view of
+// them decodes without targeting so the secondary watch stays silent.
+// A v1alpha2-written objective is stripped at storage in this state, which
+// is why the storage version must switch exactly when users recreate their
+// objects in v1.
+func TestInferenceObjectiveDualVersionV1StorageWiring(t *testing.T) {
+	cfg := startObjectiveEnv(t, "crd-dual-v1storage")
+
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(v1alpha2.Install(scheme))
+	utilruntime.Must(apixv1.Install(scheme))
+	utilruntime.Must(v1.Install(scheme))
+
+	skipNameValidation := true
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:     scheme,
+		Metrics:    metricsserver.Options{BindAddress: "0"},
+		Controller: crconfig.Controller{SkipNameValidation: &skipNameValidation},
+	})
+	require.NoError(t, err, "failed to create manager")
+
+	poolName := "dual-v1storage-pool"
+	namespace := "dual-v1storage-" + uuid.NewString()[:8]
+
+	ds := datastore.NewDatastore(t.Context(), datalayer.NewTestRuntime(t, time.Second))
+	reconciler := &controller.InferenceObjectiveReconciler{
+		Datastore: ds,
+		Reader:    mgr.GetClient(),
+		PoolGKNN: common.GKNN{
+			NamespacedName: types.NamespacedName{Name: poolName, Namespace: namespace},
+			GroupKind:      schema.GroupKind{Group: routing.InferencePoolAPIGroup, Kind: "InferencePool"},
+		},
+		RunOnNonLeaders: true,
+		PrimaryV1:       true,
+		WatchV1Alpha2:   true,
+	}
+	require.NoError(t, reconciler.SetupWithManager(mgr), "failed to set up reconciler")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	mgrErr := make(chan error, 1)
+	go func() { mgrErr <- mgr.Start(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-mgrErr; err != nil && !strings.Contains(err.Error(), "context canceled") {
+			t.Errorf("manager stopped unexpectedly: %v", err)
+		}
+	})
+
+	directClient, err := client.New(cfg, client.Options{Scheme: scheme})
+	require.NoError(t, err, "failed to create direct client")
+	require.NoError(t, directClient.Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: namespace},
+	}))
+
+	pool := testutil.MakeInferencePool(poolName).
+		Namespace(namespace).
+		Selector(map[string]string{"app": poolName}).
+		EndpointPickerRef("epp").
+		TargetPorts(8000).
+		ObjRef()
+	pool.Spec.EndpointPickerRef.Port = &v1.Port{Number: v1.PortNumber(9002)}
+	require.NoError(t, directClient.Create(ctx, pool), "failed to create pool")
+
+	// A v1-written objective loads natively through the primary watch.
+	v1Objective := testutil.MakeV1InferenceObjective("v1-objective").
+		Namespace(namespace).
+		Priority(int32(3)).
+		PoolRefs(apixv1.PoolObjectReference{Name: apixv1.ObjectName(poolName), Group: apixv1.Group(routing.InferencePoolAPIGroup)}).
+		ObjRef()
+	require.NoError(t, directClient.Create(ctx, v1Objective), "failed to create v1 objective")
+	require.Eventually(t, func() bool { return ds.ObjectiveGet("v1-objective") != nil },
+		15*time.Second, 50*time.Millisecond, "v1 objective was not loaded through the primary watch")
+	require.Eventually(t, func() bool { return len(ds.ObjectiveGetAll()) == 1 },
+		15*time.Second, 50*time.Millisecond, "expected exactly one datastore entry, got %d", len(ds.ObjectiveGetAll()))
+
+	// A v1alpha2-written objective is stripped at storage in this state.
+	legacyObjective := testutil.MakeInferenceObjective("legacy-objective").
+		Namespace(namespace).
+		Priority(int32(2)).
+		PoolName(poolName).
+		PoolGroup(routing.InferencePoolAPIGroup).
+		ObjRef()
+	require.NoError(t, directClient.Create(ctx, legacyObjective), "failed to create v1alpha2 objective")
+	legacyStored := &v1alpha2.InferenceObjective{}
+	require.NoError(t, directClient.Get(ctx, types.NamespacedName{Name: "legacy-objective", Namespace: namespace}, legacyStored))
+	require.Empty(t, legacyStored.Spec.PoolRef.Name, "None conversion must strip v1alpha2 fields under v1 storage")
+	require.Never(t, func() bool { return ds.ObjectiveGet("legacy-objective") != nil },
+		3*time.Second, 100*time.Millisecond, "stripped v1alpha2 objective must not enter the datastore")
+
+	require.NoError(t, directClient.Delete(ctx, v1Objective))
+	require.Eventually(t, func() bool { return ds.ObjectiveGet("v1-objective") == nil },
+		15*time.Second, 50*time.Millisecond, "deleted v1 objective was not removed")
 }
