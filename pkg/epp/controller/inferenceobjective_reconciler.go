@@ -265,7 +265,8 @@ func matchesPoolRefs(spec apixv1.InferenceObjectiveSpec, pool common.GKNN) bool 
 
 // matchesPool reports whether the spec targets the pool by list entry or
 // selector. A nil poolLabels means the pool is missing and selector
-// matching fails closed.
+// matching fails closed. An empty selector is rejected at admission by the
+// poolSelector validation rule and is not re-checked here.
 func matchesPool(spec apixv1.InferenceObjectiveSpec, pool common.GKNN, poolLabels map[string]string) bool {
 	if matchesPoolRefs(spec, pool) {
 		return true

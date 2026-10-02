@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -50,20 +51,16 @@ import (
 	testutil "github.com/llm-d/llm-d-router/pkg/epp/util/testing"
 )
 
-// TestInferenceObjectivePoolWatchWiring verifies against a real API server
-// that pool events requeue selector-bearing InferenceObjectives: a pool label
-// change or pool creation must re-reconcile objectives whose poolSelector
-// matches the pool, so datastore entries follow the pool's labels.
-// The v1-only InferenceObjective CRD under testdata/crd serves llm-d.ai/v1;
-// the shipped CRD serves v1alpha2 only.
-func TestInferenceObjectivePoolWatchWiring(t *testing.T) {
+// startObjectiveV1Env boots an envtest environment serving the gaie v1
+// InferencePool CRD and the v1-only InferenceObjective CRD under
+// testdata/crd. The shipped CRD serves v1alpha2 only.
+func startObjectiveV1Env(t *testing.T) *rest.Config {
+	t.Helper()
 	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}",
 		"sigs.k8s.io/gateway-api-inference-extension").Output()
 	require.NoError(t, err, "failed to locate gateway-api-inference-extension module")
 	gaieModulePath := strings.TrimSpace(string(out))
 
-	// A dedicated environment: the objective CRD must serve v1 for the
-	// PrimaryV1 reconciler watches, which the shipped v1alpha2-only CRD does not.
 	env := &envtest.Environment{
 		CRDDirectoryPaths: []string{
 			filepath.Join(gaieModulePath, "config", "crd", "bases"),
@@ -74,6 +71,15 @@ func TestInferenceObjectivePoolWatchWiring(t *testing.T) {
 	cfg, err := env.Start()
 	require.NoError(t, err, "failed to start envtest environment")
 	t.Cleanup(func() { _ = env.Stop() })
+	return cfg
+}
+
+// TestInferenceObjectivePoolWatchWiring verifies against a real API server
+// that pool events requeue selector-bearing InferenceObjectives: a pool label
+// change or pool creation must re-reconcile objectives whose poolSelector
+// matches the pool, so datastore entries follow the pool's labels.
+func TestInferenceObjectivePoolWatchWiring(t *testing.T) {
+	cfg := startObjectiveV1Env(t)
 
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -175,4 +181,41 @@ func TestInferenceObjectivePoolWatchWiring(t *testing.T) {
 	createPool("dedicated")
 	require.Eventually(t, func() bool { return !objectiveRegistered() }, 15*time.Second, 50*time.Millisecond,
 		"pool create event did not requeue the selector objective")
+}
+
+// TestInferenceObjectiveEmptySelectorRejected verifies the CRD validation
+// rule rejects an empty poolSelector at admission, so an objective cannot
+// blanket-match every pool in the namespace. The reconciler does not
+// re-check this; admission is the single enforcement point.
+func TestInferenceObjectiveEmptySelectorRejected(t *testing.T) {
+	cfg := startObjectiveV1Env(t)
+
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(apixv1.Install(scheme))
+	c, err := client.New(cfg, client.Options{Scheme: scheme})
+	require.NoError(t, err, "failed to create client")
+
+	cases := []struct {
+		name     string
+		selector *metav1.LabelSelector
+	}{
+		{name: "empty selector", selector: &metav1.LabelSelector{}},
+		{name: "empty matchLabels map", selector: &metav1.LabelSelector{MatchLabels: map[string]string{}}},
+		{name: "empty matchExpressions list", selector: &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			objective := testutil.MakeV1InferenceObjective(tc.name).
+				Namespace("default").
+				Priority(int32(1)).
+				PoolSelector(tc.selector).
+				ObjRef()
+			err := c.Create(t.Context(), objective)
+			require.Error(t, err, "empty poolSelector must be rejected at admission")
+			require.Contains(t, err.Error(), "poolSelector must not be empty")
+			err = c.Get(t.Context(), types.NamespacedName{Name: tc.name, Namespace: "default"}, &apixv1.InferenceObjective{})
+			require.True(t, errors.IsNotFound(err), "rejected objective must not be stored")
+		})
+	}
 }

@@ -109,12 +109,6 @@ var (
 				CreationTimestamp(metav1.Unix(1000, 0)).
 				PoolSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"tiers": "other"}}).
 				ObjRef()
-	v1ObjectiveSelectorEmpty = testutil.MakeV1InferenceObjective("selector-empty").
-					Namespace(inferencePool.Namespace).
-					Priority(int32(1)).
-					CreationTimestamp(metav1.Unix(1000, 0)).
-					PoolSelector(&metav1.LabelSelector{}).
-					ObjRef()
 )
 
 // toV1 converts v1alpha2 fixtures to the datastore-normalized v1 shape.
@@ -143,10 +137,6 @@ func labeledPool() *v1.InferencePool {
 	pool := testutil.MakeInferencePool("test-pool1").Namespace("ns1").ObjRef()
 	pool.Labels = map[string]string{"tiers": "shared"}
 	return pool
-}
-
-func unlabeledPool() *v1.InferencePool {
-	return testutil.MakeInferencePool("test-pool1").Namespace("ns1").ObjRef()
 }
 
 func TestInferenceObjectiveReconciler(t *testing.T) {
@@ -239,19 +229,6 @@ func TestInferenceObjectiveReconciler(t *testing.T) {
 			poolInAPIServer: labeledPool(),
 			objectiveV1:     v1ObjectiveSelectorMiss,
 			wantObjectives:  []*apixv1.InferenceObjective{},
-		},
-		{
-			name:           "v1 empty selector is ignored without pool object",
-			primaryV1:      true,
-			objectiveV1:    v1ObjectiveSelectorEmpty,
-			wantObjectives: []*apixv1.InferenceObjective{},
-		},
-		{
-			name:            "v1 empty selector matches a pool without labels",
-			primaryV1:       true,
-			poolInAPIServer: unlabeledPool(),
-			objectiveV1:     v1ObjectiveSelectorEmpty,
-			wantObjectives:  []*apixv1.InferenceObjective{v1ObjectiveSelectorEmpty},
 		},
 		{
 			name:           "v1 selector with requirements and no pool object is ignored",
@@ -538,18 +515,6 @@ func TestMatchesPool(t *testing.T) {
 			spec:       apixv1.InferenceObjectiveSpec{PoolSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"tiers": "shared"}}},
 			poolLabels: nil,
 			want:       false,
-		},
-		{
-			name:       "empty selector with no pool matches nothing",
-			spec:       apixv1.InferenceObjectiveSpec{PoolSelector: &metav1.LabelSelector{}},
-			poolLabels: nil,
-			want:       false,
-		},
-		{
-			name:       "empty selector matches a pool without labels",
-			spec:       apixv1.InferenceObjectiveSpec{PoolSelector: &metav1.LabelSelector{}},
-			poolLabels: map[string]string{},
-			want:       true,
 		},
 		{
 			name:       "invalid selector fails closed",
