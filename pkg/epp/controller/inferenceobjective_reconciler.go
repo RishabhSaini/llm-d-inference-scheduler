@@ -87,7 +87,7 @@ func (c *InferenceObjectiveReconciler) Reconcile(ctx context.Context, req ctrl.R
 					return ctrl.Result{}, fmt.Errorf("unable to get InferenceObjective - %w", err)
 				}
 			} else if legacy.DeletionTimestamp.IsZero() {
-				logger.V(logutil.VERBOSE).Info("DEPRECATION: llm-d.ai/v1alpha2/InferenceObjective is deprecated",
+				logger.Info("DEPRECATION: llm-d.ai/v1alpha2/InferenceObjective is deprecated",
 					"replacement", "llm-d.ai/v1/InferenceObjective")
 				candidates = append(candidates, apixv1.ConvertFromV1Alpha2(legacy))
 			}

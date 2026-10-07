@@ -30,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -315,8 +316,9 @@ func TestInferenceObjectiveDualVersionWiring(t *testing.T) {
 	require.Eventually(t, func() bool { return len(ds.ObjectiveGetAll()) == 1 },
 		15*time.Second, 50*time.Millisecond, "expected exactly one datastore entry, got %d", len(ds.ObjectiveGetAll()))
 
-	// A v1-written objective is accepted by the API server but its
-	// targeting is stripped at storage, so it never loads.
+	// A v1-written objective stores losslessly: the v1alpha2 storage schema
+	// is a superset of v1's targeting fields, so None conversion prunes
+	// nothing and the primary watch loads it.
 	v1Objective := testutil.MakeV1InferenceObjective("v1-objective").
 		Namespace(namespace).
 		Priority(int32(3)).
@@ -325,9 +327,33 @@ func TestInferenceObjectiveDualVersionWiring(t *testing.T) {
 	require.NoError(t, directClient.Create(ctx, v1Objective), "failed to create v1 objective")
 	stored := &apixv1.InferenceObjective{}
 	require.NoError(t, directClient.Get(ctx, types.NamespacedName{Name: "v1-objective", Namespace: namespace}, stored))
-	require.Empty(t, stored.Spec.PoolRefs, "None conversion must strip v1 fields under v1alpha2 storage")
-	require.Never(t, func() bool { return ds.ObjectiveGet("v1-objective") != nil },
-		3*time.Second, 100*time.Millisecond, "stripped v1 objective must not enter the datastore")
+	require.Len(t, stored.Spec.PoolRefs, 1, "v1 targeting must survive storage under the superset v1alpha2 schema")
+	require.Equal(t, apixv1.ObjectName(poolName), stored.Spec.PoolRefs[0].Name)
+	require.Eventually(t, func() bool { return ds.ObjectiveGet("v1-objective") != nil },
+		15*time.Second, 50*time.Millisecond, "v1 objective was not loaded through the primary watch")
+	require.Len(t, ds.ObjectiveGetAll(), 2, "legacy and v1 objectives must coexist in the datastore")
+
+	// poolRef cannot be combined with the v1 targeting fields.
+	mixed := testutil.MakeInferenceObjective("mixed-objective").
+		Namespace(namespace).
+		Priority(int32(1)).
+		PoolName(poolName).
+		PoolGroup(routing.InferencePoolAPIGroup).
+		ObjRef()
+	mixed.Spec.PoolRefs = []v1alpha2.PoolObjectReference{{Name: v1alpha2.ObjectName(poolName)}}
+	err = directClient.Create(ctx, mixed)
+	require.ErrorContains(t, err, "poolRef cannot be combined", "poolRef plus poolRefs must be rejected at admission")
+
+	// An objective with no targeting at all is rejected. The typed client
+	// always marshals the value-struct poolRef, so this needs a
+	// kubectl-style authoring path.
+	untargeted := &unstructured.Unstructured{}
+	untargeted.SetGroupVersionKind(schema.GroupVersion{Group: v1alpha2.GroupVersion.Group, Version: v1alpha2.GroupVersion.Version}.WithKind("InferenceObjective"))
+	untargeted.SetName("untargeted-objective")
+	untargeted.SetNamespace(namespace)
+	require.NoError(t, unstructured.SetNestedField(untargeted.Object, int64(1), "spec", "priority"))
+	err = directClient.Create(ctx, untargeted)
+	require.ErrorContains(t, err, "must be set", "objective without any targeting field must be rejected at admission")
 
 	require.NoError(t, directClient.Delete(ctx, legacyObjective))
 	require.Eventually(t, func() bool { return ds.ObjectiveGet("legacy-objective") == nil },
