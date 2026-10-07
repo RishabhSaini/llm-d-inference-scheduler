@@ -86,7 +86,11 @@ func (c *InferenceObjectiveReconciler) Reconcile(ctx context.Context, req ctrl.R
 				if !errors.IsNotFound(err) {
 					return ctrl.Result{}, fmt.Errorf("unable to get InferenceObjective - %w", err)
 				}
-			} else if legacy.DeletionTimestamp.IsZero() {
+			} else if legacy.DeletionTimestamp.IsZero() && legacy.Spec.PoolRef.Name != "" {
+				// Under None conversion both Gets read the same stored
+				// object; an empty poolRef means the v1alpha2 view of an
+				// object authored through v1, which the primary candidate
+				// already carries.
 				logger.Info("DEPRECATION: llm-d.ai/v1alpha2/InferenceObjective is deprecated",
 					"replacement", "llm-d.ai/v1/InferenceObjective")
 				candidates = append(candidates, apixv1.ConvertFromV1Alpha2(legacy))

@@ -22,9 +22,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -244,9 +246,11 @@ func TestInferenceObjectiveDualVersionWiring(t *testing.T) {
 	utilruntime.Must(apixv1.Install(scheme))
 	utilruntime.Must(v1.Install(scheme))
 
+	logs := &capturingLogSink{}
 	skipNameValidation := true
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:     scheme,
+		Logger:     logr.New(logs),
 		Metrics:    metricsserver.Options{BindAddress: "0"},
 		Controller: crconfig.Controller{SkipNameValidation: &skipNameValidation},
 	})
@@ -294,28 +298,6 @@ func TestInferenceObjectiveDualVersionWiring(t *testing.T) {
 	pool.Spec.EndpointPickerRef.Port = &v1.Port{Number: v1.PortNumber(9002)}
 	require.NoError(t, directClient.Create(ctx, pool), "failed to create pool")
 
-	// A v1alpha2-written objective reaches the datastore through the
-	// secondary watch, converted to the v1 shape with the poolRef mapped
-	// to a single poolRefs entry.
-	legacyObjective := testutil.MakeInferenceObjective("legacy-objective").
-		Namespace(namespace).
-		Priority(int32(2)).
-		PoolName(poolName).
-		PoolGroup(routing.InferencePoolAPIGroup).
-		ObjRef()
-	require.NoError(t, directClient.Create(ctx, legacyObjective), "failed to create v1alpha2 objective")
-	require.Eventually(t, func() bool { return ds.ObjectiveGet("legacy-objective") != nil },
-		15*time.Second, 50*time.Millisecond, "v1alpha2 objective was not loaded through the secondary watch")
-	got := ds.ObjectiveGet("legacy-objective")
-	require.NotNil(t, got.Spec.Priority)
-	require.Equal(t, int32(2), *got.Spec.Priority, "converted objective must keep its priority")
-	require.Len(t, got.Spec.PoolRefs, 1, "converted objective must target one pool")
-
-	// Both watches observe the same object (one object, two views); the
-	// datastore must hold exactly one entry.
-	require.Eventually(t, func() bool { return len(ds.ObjectiveGetAll()) == 1 },
-		15*time.Second, 50*time.Millisecond, "expected exactly one datastore entry, got %d", len(ds.ObjectiveGetAll()))
-
 	// A v1-written objective stores losslessly: the v1alpha2 storage schema
 	// is a superset of v1's targeting fields, so None conversion prunes
 	// nothing and the primary watch loads it.
@@ -331,7 +313,44 @@ func TestInferenceObjectiveDualVersionWiring(t *testing.T) {
 	require.Equal(t, apixv1.ObjectName(poolName), stored.Spec.PoolRefs[0].Name)
 	require.Eventually(t, func() bool { return ds.ObjectiveGet("v1-objective") != nil },
 		15*time.Second, 50*time.Millisecond, "v1 objective was not loaded through the primary watch")
-	require.Len(t, ds.ObjectiveGetAll(), 2, "legacy and v1 objectives must coexist in the datastore")
+
+	// Under None conversion the secondary Get reads the same stored object
+	// with an empty poolRef; that view must not log a deprecation or add a
+	// conversion candidate for a pure v1 objective.
+	require.Zero(t, logs.deprecations(), "pure v1 objective must not log a v1alpha2 deprecation")
+
+	// A typed client can author a poolRefs-only v1alpha2 objective: omitzero
+	// keeps the zero-value poolRef out of the serialized object. The v1 view
+	// carries the targeting, so the primary watch loads it.
+	refsOnly := testutil.MakeInferenceObjective("refs-only-objective").
+		Namespace(namespace).
+		Priority(int32(4)).
+		ObjRef()
+	refsOnly.Spec.PoolRefs = []v1alpha2.PoolObjectReference{{Name: v1alpha2.ObjectName(poolName)}}
+	require.NoError(t, directClient.Create(ctx, refsOnly), "typed client must be able to author a poolRefs-only v1alpha2 objective")
+	require.Eventually(t, func() bool { return ds.ObjectiveGet("refs-only-objective") != nil },
+		15*time.Second, 50*time.Millisecond, "superset-authored v1alpha2 objective was not loaded through the primary watch")
+	require.Zero(t, logs.deprecations(), "superset-authored v1alpha2 objective must not log a deprecation")
+
+	// A v1alpha2-written objective reaches the datastore through the
+	// secondary watch, converted to the v1 shape with the poolRef mapped
+	// to a single poolRefs entry, and logs the deprecation.
+	legacyObjective := testutil.MakeInferenceObjective("legacy-objective").
+		Namespace(namespace).
+		Priority(int32(2)).
+		PoolName(poolName).
+		PoolGroup(routing.InferencePoolAPIGroup).
+		ObjRef()
+	require.NoError(t, directClient.Create(ctx, legacyObjective), "failed to create v1alpha2 objective")
+	require.Eventually(t, func() bool { return ds.ObjectiveGet("legacy-objective") != nil },
+		15*time.Second, 50*time.Millisecond, "v1alpha2 objective was not loaded through the secondary watch")
+	got := ds.ObjectiveGet("legacy-objective")
+	require.NotNil(t, got.Spec.Priority)
+	require.Equal(t, int32(2), *got.Spec.Priority, "converted objective must keep its priority")
+	require.Len(t, got.Spec.PoolRefs, 1, "converted objective must target one pool")
+	require.NotZero(t, logs.deprecations(), "objective using the legacy poolRef must log the deprecation")
+
+	require.Len(t, ds.ObjectiveGetAll(), 3, "one datastore entry per objective, got %d", len(ds.ObjectiveGetAll()))
 
 	// poolRef cannot be combined with the v1 targeting fields.
 	mixed := testutil.MakeInferenceObjective("mixed-objective").
@@ -344,9 +363,8 @@ func TestInferenceObjectiveDualVersionWiring(t *testing.T) {
 	err = directClient.Create(ctx, mixed)
 	require.ErrorContains(t, err, "poolRef cannot be combined", "poolRef plus poolRefs must be rejected at admission")
 
-	// An objective with no targeting at all is rejected. The typed client
-	// always marshals the value-struct poolRef, so this needs a
-	// kubectl-style authoring path.
+	// An objective with no targeting at all is rejected; the unstructured
+	// object exercises the kubectl-style authoring path.
 	untargeted := &unstructured.Unstructured{}
 	untargeted.SetGroupVersionKind(schema.GroupVersion{Group: v1alpha2.GroupVersion.Group, Version: v1alpha2.GroupVersion.Version}.WithKind("InferenceObjective"))
 	untargeted.SetName("untargeted-objective")
@@ -465,4 +483,41 @@ func TestInferenceObjectiveDualVersionV1StorageWiring(t *testing.T) {
 	require.NoError(t, directClient.Delete(ctx, v1Objective))
 	require.Eventually(t, func() bool { return ds.ObjectiveGet("v1-objective") == nil },
 		15*time.Second, 50*time.Millisecond, "deleted v1 objective was not removed")
+}
+
+// capturingLogSink records every log message the manager emits so tests can
+// assert on reconciler log output.
+type capturingLogSink struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (s *capturingLogSink) Init(logr.RuntimeInfo) {}
+
+func (s *capturingLogSink) Enabled(int) bool { return true }
+
+func (s *capturingLogSink) Info(_ int, msg string, _ ...interface{}) { s.record(msg) }
+
+func (s *capturingLogSink) Error(_ error, msg string, _ ...interface{}) { s.record(msg) }
+
+func (s *capturingLogSink) WithValues(_ ...interface{}) logr.LogSink { return s }
+
+func (s *capturingLogSink) WithName(_ string) logr.LogSink { return s }
+
+func (s *capturingLogSink) record(msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lines = append(s.lines, msg)
+}
+
+func (s *capturingLogSink) deprecations() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, line := range s.lines {
+		if strings.Contains(line, "DEPRECATION") {
+			n++
+		}
+	}
+	return n
 }

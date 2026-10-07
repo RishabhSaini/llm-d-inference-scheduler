@@ -26,9 +26,11 @@ import (
 )
 
 // ConvertFromV1Alpha2 converts a v1alpha2 InferenceObjective to v1. The
-// single pool reference becomes the sole list entry. Empty group/kind fall
-// back to the CRD defaults so undefaulted objects still match. An empty
-// reference name yields no list entries; the objective then targets no pool.
+// single pool reference becomes the sole list entry; an object authored
+// with the v1 targeting fields (empty poolRef) passes them through
+// unchanged. Empty group/kind fall back to the CRD defaults so
+// undefaulted objects still match. An empty reference name yields no
+// list entries; the objective then targets no pool.
 func ConvertFromV1Alpha2(in *v1alpha2.InferenceObjective) *InferenceObjective {
 	if in == nil {
 		return nil
@@ -51,6 +53,22 @@ func ConvertFromV1Alpha2(in *v1alpha2.InferenceObjective) *InferenceObjective {
 				Kind:  Kind(cmp.Or(string(in.Spec.PoolRef.Kind), "InferencePool")),
 				Name:  ObjectName(in.Spec.PoolRef.Name),
 			},
+		}
+	} else {
+		// Superset-authored object: the v1 targeting fields pass through.
+		// poolRef and poolRefs never coexist on a valid object.
+		for _, ref := range in.Spec.PoolRefs {
+			if ref.Name == "" {
+				continue
+			}
+			out.Spec.PoolRefs = append(out.Spec.PoolRefs, PoolObjectReference{
+				Group: Group(cmp.Or(string(ref.Group), giev1.GroupName)),
+				Kind:  Kind(cmp.Or(string(ref.Kind), "InferencePool")),
+				Name:  ObjectName(ref.Name),
+			})
+		}
+		if in.Spec.PoolSelector != nil {
+			out.Spec.PoolSelector = in.Spec.PoolSelector.DeepCopy()
 		}
 	}
 	return out

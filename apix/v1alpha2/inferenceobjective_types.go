@@ -84,7 +84,7 @@ type InferenceObjectiveSpec struct {
 	// PoolRef is a reference to the inference pool, the pool must exist in the same namespace.
 	//
 	// +optional
-	PoolRef PoolObjectReference `json:"poolRef,omitempty"`
+	PoolRef PoolObjectReference `json:"poolRef,omitempty,omitzero"`
 
 	// PoolRefs targets the inference pools in the same namespace that
 	// this objective applies to. An objective applies to a pool when any
