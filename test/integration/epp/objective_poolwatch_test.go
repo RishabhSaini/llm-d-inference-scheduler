@@ -355,6 +355,16 @@ func TestInferenceObjectiveDualVersionWiring(t *testing.T) {
 	err = directClient.Create(ctx, untargeted)
 	require.ErrorContains(t, err, "must be set", "objective without any targeting field must be rejected at admission")
 
+	// The v1alpha2 copy of the empty-selector rule must reject on its own,
+	// independently of the v1 version of the same rule.
+	emptySelector := &unstructured.Unstructured{}
+	emptySelector.SetGroupVersionKind(schema.GroupVersion{Group: v1alpha2.GroupVersion.Group, Version: v1alpha2.GroupVersion.Version}.WithKind("InferenceObjective"))
+	emptySelector.SetName("empty-selector-objective")
+	emptySelector.SetNamespace(namespace)
+	require.NoError(t, unstructured.SetNestedMap(emptySelector.Object, map[string]interface{}{}, "spec", "poolSelector", "matchLabels"))
+	err = directClient.Create(ctx, emptySelector)
+	require.ErrorContains(t, err, "must not be empty", "v1alpha2 objective with an empty poolSelector must be rejected at admission")
+
 	require.NoError(t, directClient.Delete(ctx, legacyObjective))
 	require.Eventually(t, func() bool { return ds.ObjectiveGet("legacy-objective") == nil },
 		15*time.Second, 50*time.Millisecond, "deleted v1alpha2 objective was not removed")
