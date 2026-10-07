@@ -76,8 +76,8 @@ func ConvertFromV1Alpha2(in *v1alpha2.InferenceObjective) *InferenceObjective {
 
 // ConvertToV1Alpha2 converts a v1 InferenceObjective to v1alpha2. Only the
 // first named list entry survives; additional entries and the pool selector
-// have no v1alpha2 equivalent and are dropped. Kept for tests only; the
-// controller never downgrades served objects.
+// are dropped. Kept for tests only; the controller never downgrades served
+// objects.
 func ConvertToV1Alpha2(in *InferenceObjective) *v1alpha2.InferenceObjective {
 	if in == nil {
 		return nil
