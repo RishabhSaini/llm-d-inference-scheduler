@@ -173,6 +173,18 @@ func TestCountMMMatchedTokens(t *testing.T) {
 			want:            0,
 		},
 		{
+			// A feature starting past the match edge must not subtract from
+			// another feature's count: its overlap clamps at zero.
+			name: "feature past the match edge adds nothing",
+			features: []fwkrh.MultiModalFeature{
+				{Offset: 0, Length: 256},
+				{Offset: 400, Length: 256},
+			},
+			matchLen:        5,
+			blockSizeTokens: 64,
+			want:            256,
+		},
+		{
 			name:            "partially matched feature counts the overlap",
 			features:        []fwkrh.MultiModalFeature{{Offset: 100, Length: 50}},
 			matchLen:        2,
