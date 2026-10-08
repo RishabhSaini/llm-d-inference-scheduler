@@ -552,7 +552,7 @@ func TestPreRequest_RecordsMMPrediction(t *testing.T) {
 	endpoint := freshEndpoints()[0]
 	endpoint.Put(p.dk, attrprefix.NewPrefixCacheMatchInfo(5, 8, testBlockSize).
 		WithCachedBlockCount(5).
-		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 5}))
+		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 5, MatchTokens: 5 * testBlockSize}))
 
 	beforePredicted := sharedPrefixHistogram(t, mmPredictedCachedTokensMetric, name, prefixmetrics.RoleDecode).GetSampleSum()
 	beforePrompt := sharedPrefixHistogram(t, mmPromptTokensMetric, name, prefixmetrics.RoleDecode).GetSampleSum()
@@ -577,7 +577,7 @@ func TestPreRequest_RecordsMMPrediction_ZeroMatch(t *testing.T) {
 	endpoint := freshEndpoints()[0]
 	endpoint.Put(p.dk, attrprefix.NewPrefixCacheMatchInfo(0, 4, testBlockSize).
 		WithCachedBlockCount(0).
-		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 0}))
+		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 0, MatchTokens: 0}))
 
 	beforePredicted := sharedPrefixHistogram(t, mmPredictedCachedTokensMetric, name, prefixmetrics.RoleDecode).GetSampleCount()
 	beforePrompt := sharedPrefixHistogram(t, mmPromptTokensMetric, name, prefixmetrics.RoleDecode).GetSampleSum()
@@ -612,32 +612,63 @@ func TestPreRequest_NoMMAttribution_RecordsNothing(t *testing.T) {
 	// pair would hold a zero-over-zero observation.
 	endpoint.Put(p.dk, attrprefix.NewPrefixCacheMatchInfo(2, 8, testBlockSize).
 		WithCachedBlockCount(4).
-		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 2}))
+		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 2, MatchTokens: 2 * testBlockSize}))
 	_ = p.PreRequest(ctx, tokenizedRequest("req-text-only", 8*testBlockSize), primaryOnly("decode", endpoint))
 	assert.Equal(t, before, sharedPrefixHistogram(t, mmPredictedCachedTokensMetric, name, prefixmetrics.RoleDecode).GetSampleCount())
 }
 
-// Matched multimodal blocks cover whole blocks, so a feature that ends
-// mid-block clamps the predicted count to the feature's token length: a
-// matched block must not report more tokens than the feature holds.
-func TestPreRequest_RecordsMMPrediction_ClampedToFeatureTokens(t *testing.T) {
+// A feature that starts or ends mid-block contributes only the tokens it
+// holds: one matched block covering a 5-token feature records the feature's 5
+// tokens, not the matched block's token multiple.
+func TestPreRequest_RecordsMMPrediction_MidBlockFeature(t *testing.T) {
 	ctx := utils.NewTestContext(t)
 	prefixmetrics.Register()
 
-	const name = "precise-mm-predicted-clamped"
+	const name = "precise-mm-predicted-mid-block"
 	p := newNamedProducerForPreRequest(ctx, name, false, &fakeKVBlockIndex{})
 
 	endpoint := freshEndpoints()[0]
 	endpoint.Put(p.dk, attrprefix.NewPrefixCacheMatchInfo(1, 1, testBlockSize).
 		WithCachedBlockCount(1).
-		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 1}))
+		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 1, MatchTokens: 5}))
 
 	beforePredicted := sharedPrefixHistogram(t, mmPredictedCachedTokensMetric, name, prefixmetrics.RoleDecode).GetSampleSum()
-	_ = p.PreRequest(ctx, mmRequest("req-mm-clamped", 5), primaryOnly("decode", endpoint))
+	_ = p.PreRequest(ctx, mmRequest("req-mm-mid-block", 5), primaryOnly("decode", endpoint))
 
 	assert.Equal(t, beforePredicted+float64(5),
 		sharedPrefixHistogram(t, mmPredictedCachedTokensMetric, name, prefixmetrics.RoleDecode).GetSampleSum(),
-		"one matched block of %d tokens must clamp to the feature's 5 tokens", testBlockSize)
+		"a matched block of %d tokens must record the feature's 5 tokens", testBlockSize)
+}
+
+// Two images with only the first matched: the pair records the first image's
+// tokens. The matched MM blocks hold text at the image's edges, and a
+// block-granular count would pick that text up (32 of a 40-token MM total).
+func TestPreRequest_RecordsMMPrediction_TwoImagesFirstMatched(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	prefixmetrics.Register()
+
+	const name = "precise-mm-predicted-two-images"
+	p := newNamedProducerForPreRequest(ctx, name, false, &fakeKVBlockIndex{})
+
+	endpoint := freshEndpoints()[0]
+	endpoint.Put(p.dk, attrprefix.NewPrefixCacheMatchInfo(2, 4, testBlockSize).
+		WithCachedBlockCount(2).
+		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 2, MatchTokens: 20}))
+
+	req := tokenizedRequest("req-mm-two-images", 4*testBlockSize)
+	req.Body.TokenizedRequest.Prompts[0].MultiModalFeatures = []fwkrh.MultiModalFeature{
+		{Modality: fwkrh.ModalityImage, Hash: "img-a", Offset: 2, Length: 20},
+		{Modality: fwkrh.ModalityImage, Hash: "img-b", Offset: 32, Length: 20},
+	}
+
+	beforePredicted := sharedPrefixHistogram(t, mmPredictedCachedTokensMetric, name, prefixmetrics.RoleDecode).GetSampleSum()
+	beforePrompt := sharedPrefixHistogram(t, mmPromptTokensMetric, name, prefixmetrics.RoleDecode).GetSampleSum()
+	_ = p.PreRequest(ctx, req, primaryOnly("decode", endpoint))
+
+	assert.Equal(t, beforePredicted+float64(20),
+		sharedPrefixHistogram(t, mmPredictedCachedTokensMetric, name, prefixmetrics.RoleDecode).GetSampleSum())
+	assert.Equal(t, beforePrompt+float64(40),
+		sharedPrefixHistogram(t, mmPromptTokensMetric, name, prefixmetrics.RoleDecode).GetSampleSum())
 }
 
 // The denominator sums multimodal feature tokens across prompts, and the
@@ -653,7 +684,7 @@ func TestPreRequest_RecordsMMPrediction_MultiPrompt(t *testing.T) {
 	endpoint := freshEndpoints()[0]
 	endpoint.Put(p.dk, attrprefix.NewPrefixCacheMatchInfo(7, 11, testBlockSize).
 		WithCachedBlockCount(7).
-		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 7}))
+		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 7, MatchTokens: 7 * testBlockSize}))
 
 	req := &scheduling.InferenceRequest{
 		RequestID: "req-mm-multi",
@@ -699,7 +730,7 @@ func TestPreRequest_RecordsMMPrediction_MultipleFeaturesInPrompt(t *testing.T) {
 	endpoint := freshEndpoints()[0]
 	endpoint.Put(p.dk, attrprefix.NewPrefixCacheMatchInfo(7, 7, testBlockSize).
 		WithCachedBlockCount(7).
-		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 7}))
+		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 7, MatchTokens: 7 * testBlockSize}))
 
 	req := tokenizedRequest("req-mm-features", 7*testBlockSize)
 	req.Body.TokenizedRequest.Prompts[0].MultiModalFeatures = []fwkrh.MultiModalFeature{
@@ -730,10 +761,10 @@ func TestPreRequest_PD_RecordsMMPrediction(t *testing.T) {
 	decode, prefill := endpoints[0], endpoints[1]
 	decode.Put(p.dk, attrprefix.NewPrefixCacheMatchInfo(8, 8, testBlockSize).
 		WithCachedBlockCount(8).
-		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 8}))
+		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 8, MatchTokens: 8 * testBlockSize}))
 	prefill.Put(p.dk, attrprefix.NewPrefixCacheMatchInfo(3, 8, testBlockSize).
 		WithCachedBlockCount(3).
-		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 3}))
+		WithMM(attrprefix.MMMatchInfo{MatchBlocks: 3, MatchTokens: 3 * testBlockSize}))
 
 	beforePrefill := sharedPrefixHistogram(t, mmPredictedCachedTokensMetric, name, prefixmetrics.RolePrefill).GetSampleSum()
 	beforePrompt := sharedPrefixHistogram(t, mmPromptTokensMetric, name, prefixmetrics.RolePrefill).GetSampleSum()

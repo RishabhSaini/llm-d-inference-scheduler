@@ -245,12 +245,12 @@ so summing over `modality` keeps every ratio below exact.
 The mm pair covers only requests whose match info carries multimodal attribution, so text-only
 requests never enter it and a zero observation means a multimodal request matched no blocks. Only
 the `precise-prefix-cache-producer` records it: the approximate producer's match is not
-multimodal-tainted. The predicted count is block-granular, so a feature that ends mid-block clamps
-it to the feature's token count. Dividing `llm_d_epp_prefix_mm_predicted_cached_tokens_sum` by
-`llm_d_epp_prefix_mm_prompt_tokens_sum` gives the share of the request's multimodal tokens the
-routing decision served from cache; the prompt-level pair mixes text and multimodal tokens, so it
-cannot report that share. The pair carries no modality label: its predicted count aggregates every
-modality the request carries.
+multimodal-tainted. The predicted count sums each feature's tokens inside the matched prefix, so a
+feature that starts or ends mid-block contributes only the tokens it holds. Dividing
+`llm_d_epp_prefix_mm_predicted_cached_tokens_sum` by `llm_d_epp_prefix_mm_prompt_tokens_sum` gives
+the share of the request's multimodal tokens the routing decision served from cache; the
+prompt-level pair mixes text and multimodal tokens, so it cannot report that share. The pair
+carries no modality label: its predicted count aggregates every modality the request carries.
 
 The prefix hit rate the router predicted is `llm_d_epp_prefix_predicted_cached_tokens_sum` divided
 by `llm_d_epp_prefix_prompt_tokens_sum`. All four metrics are observed in one call, so any ratio

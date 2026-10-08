@@ -153,8 +153,9 @@ func (p *Producer) recordPrediction(request *scheduling.InferenceRequest, schedu
 // the endpoint to serve from its prefix cache, measured against the request's
 // multimodal token total. Match info without multimodal attribution covers a
 // text-only request, which records nothing, so a zero observation means a
-// multimodal request matched no blocks. Matched blocks cover whole blocks, so
-// a feature that ends mid-block clamps the count to its token length.
+// multimodal request matched no blocks. The producer counts each feature's
+// tokens inside the matched prefix, so a feature that starts or ends
+// mid-block contributes only the tokens it holds.
 func (p *Producer) recordMMPrediction(request *scheduling.InferenceRequest, role string, info *attrprefix.PrefixCacheMatchInfo) {
 	mm := info.MM()
 	if mm == nil {
@@ -169,9 +170,8 @@ func (p *Producer) recordMMPrediction(request *scheduling.InferenceRequest, role
 	if mmPromptTokens == 0 {
 		return
 	}
-	mmPredicted := min(mm.MatchBlocks*info.BlockSizeTokens(), mmPromptTokens)
 	prefixmetrics.RecordMMPrediction(p.typedName.Name, p.typedName.Type, role,
-		mmPredicted, mmPromptTokens)
+		mm.MatchTokens, mmPromptTokens)
 }
 
 // buildSpeculativeCache constructs the TTL cache used to evict speculative
