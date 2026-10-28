@@ -93,6 +93,30 @@ func TestEstimateBackend_ImagesEstimatesPromptPseudoTokens(t *testing.T) {
 	assert.Equal(t, packBytes([]byte(prompt)), tp.Prompts[0].TokenIDs)
 }
 
+// TestEstimateBackend_ImagesIncludesNegativePrompt asserts an
+// images-generations/edits request's negative prompt is folded into the
+// estimated text alongside the prompt, since both are encoded for
+// classifier-free guidance.
+func TestEstimateBackend_ImagesIncludesNegativePrompt(t *testing.T) {
+	tp, err := estimateBackend{}.produce(context.Background(), &fwkrh.InferenceRequestBody{
+		Images: &fwkrh.ImagesGenerationsRequest{Prompt: "a cat wearing a hat", NegativePrompt: "blurry"},
+	})
+	require.NoError(t, err)
+	require.Len(t, tp.Prompts, 1)
+	assert.Equal(t, packBytes([]byte("a cat wearing a hat\nblurry")), tp.Prompts[0].TokenIDs)
+}
+
+// TestEstimateBackend_ImagesIgnoresWhitespaceOnlyNegativePrompt asserts a
+// whitespace-only negative prompt is treated as absent.
+func TestEstimateBackend_ImagesIgnoresWhitespaceOnlyNegativePrompt(t *testing.T) {
+	tp, err := estimateBackend{}.produce(context.Background(), &fwkrh.InferenceRequestBody{
+		Images: &fwkrh.ImagesGenerationsRequest{Prompt: "a cat wearing a hat", NegativePrompt: "   "},
+	})
+	require.NoError(t, err)
+	require.Len(t, tp.Prompts, 1)
+	assert.Equal(t, packBytes([]byte("a cat wearing a hat")), tp.Prompts[0].TokenIDs)
+}
+
 // TestEstimateBackend_CompletionsTokenIDsPassthrough asserts token-ID completions
 // input is passed through as real tokens, not byte-estimated.
 func TestEstimateBackend_CompletionsTokenIDsPassthrough(t *testing.T) {
