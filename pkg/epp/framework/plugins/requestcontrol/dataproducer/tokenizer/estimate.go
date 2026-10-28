@@ -292,13 +292,17 @@ func imageGenerationText(r *fwkrh.ImagesGenerationsRequest) string {
 }
 
 // ttsText joins a text-to-speech request's spoken text with its style
-// instructions, matching vLLM Omni's usage accounting, which tokenizes and
-// charges for both.
+// instructions and, for voice cloning, the reference-audio transcript: vLLM
+// Omni tokenizes all three as real engine prefill, not just metadata.
 func ttsText(r *fwkrh.TextToSpeechRequest) string {
-	if strings.TrimSpace(r.Instructions) == "" {
-		return r.Input
+	text := r.Input
+	if strings.TrimSpace(r.Instructions) != "" {
+		text += "\n" + r.Instructions
 	}
-	return r.Input + "\n" + r.Instructions
+	if strings.TrimSpace(r.RefText) != "" {
+		text += "\n" + r.RefText
+	}
+	return text
 }
 
 // chatCompletionsBytes flattens roles + text into pseudo-token bytes, folding
