@@ -167,7 +167,7 @@ func (b renderBackend) produce(ctx context.Context, body *fwkrh.InferenceRequest
 		}
 		return fwkrh.NewTokenizedRequest(tokenIDs), nil
 	case body.TextToSpeech != nil:
-		tokenIDs, _, err := b.tk.Render(ctx, fwkrh.PayloadMap{"model": b.modelName, "prompt": body.TextToSpeech.Input})
+		tokenIDs, _, err := b.tk.Render(ctx, fwkrh.PayloadMap{"model": b.modelName, "prompt": ttsText(body.TextToSpeech)})
 		if err != nil {
 			return nil, fmt.Errorf("tokenization failed: %w", err)
 		}

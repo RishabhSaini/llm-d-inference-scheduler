@@ -271,10 +271,20 @@ func estimateBytes(body *fwkrh.InferenceRequestBody) ([]byte, error) {
 	case body.Generate != nil && body.Generate.Text != "":
 		return []byte(body.Generate.Text), nil
 	case body.TextToSpeech != nil:
-		return []byte(body.TextToSpeech.Input), nil
+		return []byte(ttsText(body.TextToSpeech)), nil
 	default:
 		return nil, errors.New("unsupported request body type, skipping estimation")
 	}
+}
+
+// ttsText joins a text-to-speech request's spoken text with its style
+// instructions, matching vLLM Omni's usage accounting, which tokenizes and
+// charges for both.
+func ttsText(r *fwkrh.TextToSpeechRequest) string {
+	if r.Instructions == "" {
+		return r.Input
+	}
+	return r.Input + "\n" + r.Instructions
 }
 
 // chatCompletionsBytes flattens roles + text into pseudo-token bytes, folding

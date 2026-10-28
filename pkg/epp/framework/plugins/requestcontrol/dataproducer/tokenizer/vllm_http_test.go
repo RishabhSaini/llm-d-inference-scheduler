@@ -225,6 +225,29 @@ func TestProduce_TextToSpeechVLLMHTTPRenders(t *testing.T) {
 	assert.Equal(t, "hello", sent["prompt"])
 }
 
+// TestProduce_TextToSpeechVLLMHTTPRendersWithInstructions asserts instructions
+// are folded into the rendered prompt alongside input.
+func TestProduce_TextToSpeechVLLMHTTPRendersWithInstructions(t *testing.T) {
+	srv, cap := httpFixture(t,
+		[]renderResponse{{TokenIDs: []uint32{4, 5, 6}}}, renderResponse{})
+	defer srv.Close()
+
+	req := &scheduling.InferenceRequest{
+		Body: &fwkrh.InferenceRequestBody{
+			TextToSpeech: &fwkrh.TextToSpeechRequest{Input: "hello", Instructions: "cheerful radio voice"},
+		},
+	}
+
+	p := newTestPlugin(newHTTPRenderer(t, srv))
+	require.NoError(t, p.Produce(context.Background(), req, nil))
+	require.NotNil(t, req.Body.TokenizedRequest)
+	assert.Equal(t, []uint32{4, 5, 6}, req.Body.TokenizedRequest.Prompts[0].TokenIDs)
+
+	var sent map[string]any
+	require.NoError(t, json.Unmarshal(cap.completions, &sent))
+	assert.Equal(t, "hello\ncheerful radio voice", sent["prompt"])
+}
+
 // TestVLLMHTTPRenderer_RenderChat_Multimodal covers the chat endpoint: the raw
 // payload is forwarded directly and multimodal features are converted from wire
 // format to kvcache map shape.
