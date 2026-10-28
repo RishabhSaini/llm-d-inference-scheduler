@@ -281,7 +281,7 @@ func estimateBytes(body *fwkrh.InferenceRequestBody) ([]byte, error) {
 // instructions, matching vLLM Omni's usage accounting, which tokenizes and
 // charges for both.
 func ttsText(r *fwkrh.TextToSpeechRequest) string {
-	if r.Instructions == "" {
+	if strings.TrimSpace(r.Instructions) == "" {
 		return r.Input
 	}
 	return r.Input + "\n" + r.Instructions

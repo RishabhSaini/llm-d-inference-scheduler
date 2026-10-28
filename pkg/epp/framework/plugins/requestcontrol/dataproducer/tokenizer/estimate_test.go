@@ -102,6 +102,19 @@ func TestEstimateBackend_TextToSpeechIncludesInstructions(t *testing.T) {
 	assert.Equal(t, packBytes([]byte("hello\ncheerful radio voice")), tp.Prompts[0].TokenIDs)
 }
 
+// TestEstimateBackend_TextToSpeechIgnoresWhitespaceOnlyInstructions asserts
+// whitespace-only instructions are treated as absent, matching vLLM Omni's
+// usage accounting, which only charges instructions tokens when the
+// instructions text is non-blank.
+func TestEstimateBackend_TextToSpeechIgnoresWhitespaceOnlyInstructions(t *testing.T) {
+	tp, err := estimateBackend{}.produce(context.Background(), &fwkrh.InferenceRequestBody{
+		TextToSpeech: &fwkrh.TextToSpeechRequest{Input: "hello", Instructions: "   "},
+	})
+	require.NoError(t, err)
+	require.Len(t, tp.Prompts, 1)
+	assert.Equal(t, packBytes([]byte("hello")), tp.Prompts[0].TokenIDs)
+}
+
 // TestEstimateBackend_CompletionsTokenIDsPassthrough asserts token-ID completions
 // input is passed through as real tokens, not byte-estimated.
 func TestEstimateBackend_CompletionsTokenIDsPassthrough(t *testing.T) {

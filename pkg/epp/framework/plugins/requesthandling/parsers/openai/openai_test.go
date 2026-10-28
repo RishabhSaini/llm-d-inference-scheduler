@@ -1077,6 +1077,16 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name:    "text to speech request with non-string instructions",
+			headers: map[string]string{":path": "/v1/audio/speech"},
+			body: map[string]any{
+				"model":        "test",
+				"input":        "hello",
+				"instructions": 42,
+			},
+			wantErr: true,
+		},
 		// Path-based detection tests
 		{
 			name:    "conversations API via path",
