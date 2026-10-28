@@ -270,6 +270,8 @@ func estimateBytes(body *fwkrh.InferenceRequestBody) ([]byte, error) {
 		return []byte(body.Embeddings.Input.PlainText()), nil
 	case body.Generate != nil && body.Generate.Text != "":
 		return []byte(body.Generate.Text), nil
+	case body.Images != nil:
+		return []byte(body.Images.Prompt), nil
 	default:
 		return nil, errors.New("unsupported request body type, skipping estimation")
 	}

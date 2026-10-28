@@ -78,6 +78,21 @@ func TestEstimateBackend_GenerateTextEstimatesPseudoTokens(t *testing.T) {
 	assert.Equal(t, packBytes([]byte(prompt)), tp.Prompts[0].TokenIDs)
 }
 
+// TestEstimateBackend_ImagesEstimatesPromptPseudoTokens asserts an
+// images-generations/edits request's prompt text is byte-estimated into
+// pseudo-tokens, like other text-only protocols. The request's size, steps,
+// and image count describe the generation's output cost, not its input, so
+// they are not part of this estimate.
+func TestEstimateBackend_ImagesEstimatesPromptPseudoTokens(t *testing.T) {
+	prompt := "a cat wearing a hat"
+	tp, err := estimateBackend{}.produce(context.Background(), &fwkrh.InferenceRequestBody{
+		Images: &fwkrh.ImagesGenerationsRequest{Prompt: prompt, Size: "1024x1024"},
+	})
+	require.NoError(t, err)
+	require.Len(t, tp.Prompts, 1)
+	assert.Equal(t, packBytes([]byte(prompt)), tp.Prompts[0].TokenIDs)
+}
+
 // TestEstimateBackend_CompletionsTokenIDsPassthrough asserts token-ID completions
 // input is passed through as real tokens, not byte-estimated.
 func TestEstimateBackend_CompletionsTokenIDsPassthrough(t *testing.T) {
