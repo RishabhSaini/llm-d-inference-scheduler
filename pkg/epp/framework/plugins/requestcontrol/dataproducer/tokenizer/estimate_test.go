@@ -117,6 +117,18 @@ func TestEstimateBackend_ImagesIgnoresWhitespaceOnlyNegativePrompt(t *testing.T)
 	assert.Equal(t, packBytes([]byte("a cat wearing a hat")), tp.Prompts[0].TokenIDs)
 }
 
+// TestEstimateBackend_TextToSpeechEstimatesPseudoTokens asserts TTS input text
+// is byte-estimated into pseudo-tokens, like generate text.
+func TestEstimateBackend_TextToSpeechEstimatesPseudoTokens(t *testing.T) {
+	input := "hello world"
+	tp, err := estimateBackend{}.produce(context.Background(), &fwkrh.InferenceRequestBody{
+		TextToSpeech: &fwkrh.TextToSpeechRequest{Input: input},
+	})
+	require.NoError(t, err)
+	require.Len(t, tp.Prompts, 1)
+	assert.Equal(t, packBytes([]byte(input)), tp.Prompts[0].TokenIDs)
+}
+
 // TestEstimateBackend_CompletionsTokenIDsPassthrough asserts token-ID completions
 // input is passed through as real tokens, not byte-estimated.
 func TestEstimateBackend_CompletionsTokenIDsPassthrough(t *testing.T) {
