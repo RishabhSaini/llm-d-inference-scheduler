@@ -932,6 +932,26 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 			},
 		},
 		{
+			name:    "text to speech request with instructions",
+			headers: map[string]string{":path": "/v1/audio/speech"},
+			body: map[string]any{
+				"model":        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+				"input":        "Hello from llm-d.",
+				"instructions": "Speak in a cheerful, upbeat radio-host voice.",
+			},
+			want: &fwkrh.InferenceRequestBody{
+				TextToSpeech: &fwkrh.TextToSpeechRequest{
+					Input:        "Hello from llm-d.",
+					Instructions: "Speak in a cheerful, upbeat radio-host voice.",
+				},
+				Payload: fwkrh.PayloadMap{
+					"model":        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+					"input":        "Hello from llm-d.",
+					"instructions": "Speak in a cheerful, upbeat radio-host voice.",
+				},
+			},
+		},
+		{
 			name:    "text to speech request via prefix-mounted path with stream",
 			headers: map[string]string{":path": "/openai/v1/audio/speech"},
 			body: map[string]any{
@@ -1054,6 +1074,16 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 			body: map[string]any{
 				"model": "test",
 				"input": []any{"not", "supported"},
+			},
+			wantErr: true,
+		},
+		{
+			name:    "text to speech request with non-string instructions",
+			headers: map[string]string{":path": "/v1/audio/speech"},
+			body: map[string]any{
+				"model":        "test",
+				"input":        "hello",
+				"instructions": 42,
 			},
 			wantErr: true,
 		},
