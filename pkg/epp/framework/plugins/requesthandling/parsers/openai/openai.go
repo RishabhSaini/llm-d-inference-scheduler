@@ -182,7 +182,7 @@ func isStreamingRequest(apiType string, bodyMap map[string]any) bool {
 	if stream, ok := bodyMap["stream"].(bool); ok && stream {
 		return true
 	}
-	if apiType != audioSpeechAPI && apiType != audioGenerateAPI {
+	if apiType != audioSpeechAPI {
 		return false
 	}
 	streamFormat, _ := bodyMap["stream_format"].(string)

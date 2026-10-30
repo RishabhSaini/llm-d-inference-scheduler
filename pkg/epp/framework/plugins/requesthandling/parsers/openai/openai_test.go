@@ -1086,7 +1086,7 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 			},
 		},
 		{
-			name:    "audio generate request with raw audio stream format",
+			name:    "audio generate request with stream_format is not treated as streaming",
 			headers: map[string]string{":path": "/v1/audio/generate"},
 			body: map[string]any{
 				"model":         "stabilityai/stable-audio-open-1.0",
@@ -1102,7 +1102,7 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 					"input":         "a dog barking in the rain",
 					"stream_format": "audio",
 				},
-				Stream: true,
+				Stream: false,
 			},
 		},
 		{
